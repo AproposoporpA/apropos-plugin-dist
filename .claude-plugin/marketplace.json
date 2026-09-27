@@ -1,0 +1,15 @@
+{
+  "name": "apropos-plugin",
+  "owner": {
+    "name": "AproposoporpA"
+  },
+  "plugins": [
+    {
+      "name": "apropos",
+      "source": ".",
+      "description": "Reliable per-turn Apropos time recording with a local durable queue. Calls the internal RICO write skill; contains no credentials.",
+      "version": "0.2.9",
+      "category": "productivity"
+    }
+  ]
+}
