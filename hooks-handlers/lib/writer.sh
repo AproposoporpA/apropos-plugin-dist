@@ -205,6 +205,38 @@ oe_record() {
   _oe_unlock
 }
 
+# oe_update_desc <activityKey> <entryId> <descb64> - after an ACCEPTED amend, make the record's
+# last-written field the description just written, so the next amend is checked against the
+# recorder's own latest write. Only the insert used to set it, so from the second amend on the
+# expectation was the first description, the writer refused it as though a person had
+# corrected the row, and the turn opened a second entry for the same work.
+#
+# Touches only the line that still points at this entry: if another session has since opened
+# a new entry for the activity, its line is left alone. The open time is kept, because the
+# merge cap runs from when the entry opened. Same lock and encoding as oe_record. Without the
+# lock nothing is written, so the next amend is refused and recorded as its own entry: an
+# extra row, never an overwritten correction.
+oe_update_desc() {
+  local key="$1" id="$2" descb64="$3" tmp k i e b found=0 wrote=0
+  [[ "$id" =~ ^[0-9]+$ ]] || return 1
+  [[ -s "$APROPOS_OPEN_FILE" ]] || return 1
+  _oe_lock || return 1
+  tmp="$APROPOS_OPEN_FILE.tmp.$$"
+  {
+    while IFS=$'\t' read -r k i e b; do
+      if [[ "$k" == "$key" && "$i" == "$id" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$k" "$i" "$e" "$descb64"; found=1
+      else
+        printf '%s\t%s\t%s\t%s\n' "$k" "$i" "$e" "$b"
+      fi
+    done < "$APROPOS_OPEN_FILE"
+  } > "$tmp" 2>/dev/null && wrote=1
+  (( found && wrote )) && mv "$tmp" "$APROPOS_OPEN_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null || true
+  _oe_unlock
+  (( found && wrote ))
+}
+
 # amend_entry <entryId> <person> <desc> — rewrite an open entry's description instead of
 # inserting a second row beside it. Returns non-zero so the caller can fall back to a
 # normal insert; losing the amend must never lose the time.
@@ -233,19 +265,27 @@ amend_entry() {
 # written (see lib/ledger.sh), so Update-TimeDescription.ps1 resolves the row itself
 # from (PersonID, StartTime) via -StartTimeUTC instead. Same ExpectDescription guard,
 # same mock hook, same shape, as amend_entry.
+#
+# Returns 3 when the script found no entry at all. The script exits 1 both for that
+# and for an unreachable database or an ambiguous match; only its own message tells them
+# apart, so the message is read here. The daily pass removes a row whose entry is gone, and
+# must never remove one merely because the database could not be reached.
 amend_by_start() {
   if [[ -n "${APROPOS_AMENDER:-}" ]]; then "$APROPOS_AMENDER" "$@"; return $?; fi
   local start="$1" person="$2" desc="$3" expect="${4:-}"
   local script="${APROPOS_SKILL_DIR:-R:/Intranet/ClaudeAI/skills/work-management/time}/Update-TimeDescription.ps1"
   [[ -f "$script" ]] || return 1
   local ps; ps="$(apropos_ps_exe)" || return 1
+  local out rc
   if [[ -n "$expect" ]]; then
-    "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
-      -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" -ExpectDescription "$expect" >/dev/null 2>&1
+    out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+      -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" -ExpectDescription "$expect" 2>/dev/null)"; rc=$?
   else
-    "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
-      -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" >/dev/null 2>&1
+    out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+      -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" 2>/dev/null)"; rc=$?
   fi
+  if [[ "$rc" == "1" ]] && printf '%s\n' "$out" | grep -q '^No entry '; then return 3; fi
+  return "$rc"
 }
 
 # lookup_person <login> - ask Apropos which person carries this login. Read-only. Prints

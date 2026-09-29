@@ -16,10 +16,29 @@ SI_BUDGET="${APROPOS_SESSION_BUDGET_SECS:-25}"
 # under way can normally finish rather than be cut off by the hard limit. 20 because one real
 # write was measured at 12 to 20 seconds; the first value, 8, let a write start with too little
 # time left, and a write cut off after its insert had committed is sent again next time. The
-# daily pass is held to the same margin. Whatever this leaves is delivered by the next turns.
+# daily pass's closing flush is held to the same margin. Whatever this leaves is delivered by
+# the next turns.
 SI_DELIVERY="${APROPOS_SESSION_DELIVERY_SECS:-20}"
+# The daily repair pass is started with at least this many seconds of the budget left. It
+# was held to SI_DELIVERY until 0.2.9, which made sense while it had to finish in one go.
+# Since 0.2.10 it resumes where it stopped, settles the rows with nothing to send in a
+# second or two, and starts a correction only when it has time to finish one, so a few
+# seconds is enough to make progress, and waiting for 20 skipped it on every start whose
+# lookup or flush took more than five.
+SI_SWEEP_MIN="${APROPOS_SESSION_SWEEP_SECS:-6}"
+# Taken off the pass's own deadline so it ends, logs and unlocks before the hard limit.
+SI_SWEEP_RESERVE="${APROPOS_SESSION_SWEEP_RESERVE_SECS:-2}"
+# The hard limit asks the slow work to stop, then kills it this many seconds later if it has
+# not, so a child that ignores the request cannot hold the hook past Claude Code's 30 second
+# timeout: the budget's 25 plus this 2 still leaves the alerts time to print. 1 was considered
+# and not taken: a pass that does stop when asked was measured taking 0.5 to 2.5 seconds, on a
+# busy machine, to write its log line and release its lock, and 1 would usually kill it partway.
+SI_KILL_GRACE="${APROPOS_SESSION_KILL_GRACE_SECS:-2}"
+[[ "$SI_KILL_GRACE" =~ ^[0-9]+$ ]] || SI_KILL_GRACE=2
 [[ "$SI_BUDGET" =~ ^[0-9]+$ ]] || SI_BUDGET=25
 [[ "$SI_DELIVERY" =~ ^[0-9]+$ ]] || SI_DELIVERY=20
+[[ "$SI_SWEEP_MIN" =~ ^[0-9]+$ ]] || SI_SWEEP_MIN=6
+[[ "$SI_SWEEP_RESERVE" =~ ^[0-9]+$ ]] || SI_SWEEP_RESERVE=2
 si_left() { printf '%s' $(( SI_BUDGET - (SECONDS - SI_T0) )); }
 
 P="${CLAUDE_PLUGIN_ROOT:-}"; P="${P//\\//}"
@@ -62,7 +81,8 @@ fi
 CATCHALL_DIR="${HOME}/.claude/apropos-time"
 CATCHALL_TODAY="$CATCHALL_DIR/catchall-$(date -u +%Y-%m-%d).tsv"
 if [[ -d "$CATCHALL_DIR" ]]; then
-  find "$CATCHALL_DIR" -maxdepth 1 -name 'catchall-*.tsv' -mtime +7 -delete 2>/dev/null || true
+  # The recorder's tally of withheld flags is kept for the same week.
+  find "$CATCHALL_DIR" -maxdepth 1 \( -name 'catchall-*.tsv' -o -name 'withheld-flags-*.tsv' \) -mtime +7 -delete 2>/dev/null || true
 fi
 if [[ -s "$CATCHALL_TODAY" ]]; then
   n=$(grep -c . "$CATCHALL_TODAY" 2>/dev/null || echo 0)
@@ -108,7 +128,7 @@ SI_TO=""
 si_bounded() {   # si_bounded <seconds> <command...>
   local s="$1"; shift
   (( s >= 1 )) || return 0
-  if [[ -n "$SI_TO" ]]; then "$SI_TO" "$s" "$@"; else "$@"; fi
+  if [[ -n "$SI_TO" ]]; then "$SI_TO" -k "$SI_KILL_GRACE" "$s" "$@"; else "$@"; fi
 }
 left="$(si_left)"
 if (( HAVE_LIBS )) && (( left > SI_DELIVERY )); then
@@ -116,11 +136,53 @@ if (( HAVE_LIBS )) && (( left > SI_DELIVERY )); then
   si_bounded "$left" bash -c 'source "$1/hooks-handlers/lib/queue.sh"; source "$1/hooks-handlers/lib/writer.sh"; source "$1/hooks-handlers/lib/person.sh"; q_flush "$2" write_entry' _ "$P" "$QUEUE" >/dev/null 2>&1 </dev/null || true
 fi
 left="$(si_left)"
-if [[ -n "$P" && -f "$P/hooks-handlers/time-track-per-turn.sh" ]] && (( left > SI_DELIVERY )); then
-  export APROPOS_FLUSH_DEADLINE=$(( $(date -u +%s) + left - SI_DELIVERY ))
-  printf '{"hook_event_name":"Sweep"}' | si_bounded "$left" bash "$P/hooks-handlers/time-track-per-turn.sh" >/dev/null 2>&1 || true
+if [[ -n "$P" && -f "$P/hooks-handlers/time-track-per-turn.sh" ]]; then
+  if (( left > SI_SWEEP_MIN )); then
+    si_now="$(date -u +%s)"
+    # No queued delivery is started by the pass's closing flush unless SI_DELIVERY seconds
+    # remain, exactly as before; a deadline already past simply starts none.
+    export APROPOS_FLUSH_DEADLINE=$(( si_now + left - SI_DELIVERY ))
+    export APROPOS_SWEEP_DEADLINE=$(( si_now + left - SI_SWEEP_RESERVE ))
+    printf '{"hook_event_name":"Sweep"}' | si_bounded "$left" bash "$P/hooks-handlers/time-track-per-turn.sh" >/dev/null 2>&1 || true
+  elif [[ -f "$P/hooks-handlers/lib/ledger.sh" ]]; then
+    # A due pass that could not even start is written down, so support can tell a start
+    # that ran out of time from a pass that was never due.
+    ( source "$P/hooks-handlers/lib/ledger.sh"; sweep_due && sweep_log "skipped result=no-time left=${left}s" ) >/dev/null 2>&1 </dev/null || true
+  fi
 fi
-unset APROPOS_FLUSH_DEADLINE
+unset APROPOS_FLUSH_DEADLINE APROPOS_SWEEP_DEADLINE
+
+# A daily pass that has not completed for days leaves flagged entries uncorrected, and nothing
+# else would say so. Checked after this start's own pass, so a pass that has just completed is
+# never reported, and only while entries are waiting. A person who cannot be identified is
+# already told why nothing records, and the pass cannot run for them anyway.
+LEDGER="${APROPOS_LEDGER_FILE:-$HOME/.claude/apropos-time/flagged.tsv}"
+if (( HAVE_LIBS )) && [[ -z "$PERSON_ALERT_CAUSE" && -s "$LEDGER" && -f "$P/hooks-handlers/lib/ledger.sh" ]]; then
+  source "$P/hooks-handlers/lib/ledger.sh"
+  if sweep_overdue; then
+    waiting=$(grep -c . "$LEDGER" 2>/dev/null)
+    [[ "$waiting" =~ ^[0-9]+$ ]] || waiting=0
+    if (( waiting > 0 )); then
+      # The flag texts are named so the entries can be found in Apropos. The age limit is the
+      # recorder's APROPOS_SWEEP_DAYS: past it an entry leaves the list unrepaired, so the
+      # alert says so rather than promising that nothing is lost.
+      if (( waiting == 1 )); then
+        si_w="1 entry still begins"; si_them="it"; si_those="that entry"
+      else
+        si_w="$waiting entries still begin"; si_them="them"; si_those="those entries"
+      fi
+      # Who to send the log to. The shipped copy names no one, so the default is a role; a team
+      # names its own contact with APROPOS_SUPPORT_CONTACT. Line breaks and other control
+      # characters in it are read as spaces, so the alert stays one line.
+      si_contact="${APROPOS_SUPPORT_CONTACT:-}"
+      si_contact="${si_contact//[[:cntrl:]]/ }"
+      si_contact="${si_contact#"${si_contact%%[![:space:]]*}"}"; si_contact="${si_contact%"${si_contact##*[![:space:]]}"}"
+      [[ -n "$si_contact" ]] || si_contact="the person who looks after time recording"
+      echo ""
+      echo "APROPOS ALERT: the daily pass that fills in flagged time entries has not completed for ${SW_OVERDUE_DAYS} days, and ${si_w} with [needs description] or [rewrite description] in Apropos. Session starts keep working through ${si_them}, but an entry still flagged ${APROPOS_SWEEP_DAYS:-7} days after it was recorded is no longer filled in automatically. If this alert is here tomorrow, correct ${si_those} in Apropos by hand and send ~/.claude/apropos-time/sweep.log to ${si_contact}."
+    fi
+  fi
+fi
 
 # 5. Entries the write path itself has not delivered, counted after the flush so an entry
 # that was merely waiting for this session is not reported as a failure. Entries held only

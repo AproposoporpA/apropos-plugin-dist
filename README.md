@@ -28,10 +28,12 @@ If the alert names no login, none could be read on this computer at all. Turns k
 Run these in Claude Code:
 
 ```
-/plugin marketplace add AproposoporpA/apropos-plugin-dist
+/plugin marketplace add https://github.com/AproposoporpA/apropos-plugin-dist.git
 /plugin install apropos@apropos-plugin
 /apropos:setup
 ```
+
+No GitHub account or access is needed. Give the full HTTPS address exactly as shown, not the short `owner/repo` form: a mistyped short form makes Claude Code fall back to SSH, which fails with "Permission denied (publickey)" on a computer without an SSH key. The HTTPS address never needs a key.
 
 Then fully quit and reopen Claude Code. `/apropos:setup` removes the older time recording instructions and hook from your Claude Code settings, backing them up first. It is safe to run again.
 
@@ -54,7 +56,7 @@ Removing the marketplace in step 2 may uninstall the plugin, so nothing is recor
 
 1. Make sure nothing is waiting to be delivered. In `~/.claude/apropos-time/`, `pending.tsv` must be missing or empty; if it has lines, stay on the network for a session or two until it empties. Check `pending.tsv.dead` as well: its lines are entries the plugin stopped retrying after repeated attempts. They are kept but never delivered, so have them entered in Apropos before you move.
 2. Run `/plugin marketplace remove apropos-plugin`.
-3. Run `/plugin marketplace add AproposoporpA/apropos-plugin-dist`.
+3. Run `/plugin marketplace add https://github.com/AproposoporpA/apropos-plugin-dist.git`.
 4. Run `/plugin install apropos@apropos-plugin`.
 5. Open `~/.claude/settings.json` and look for the key `extraKnownMarketplaces.apropos-plugin.source.repo`. If it is there, change it to the public copy, or Claude Code registers the original source again. If it is not there, leave the file alone.
 
