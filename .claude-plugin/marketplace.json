@@ -8,7 +8,7 @@
       "name": "apropos",
       "source": ".",
       "description": "Reliable per-turn Apropos time recording with a local durable queue. Calls the internal RICO write skill; contains no credentials.",
-      "version": "0.2.10",
+      "version": "0.2.12",
       "category": "productivity"
     }
   ]

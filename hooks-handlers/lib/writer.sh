@@ -270,18 +270,26 @@ amend_entry() {
 # and for an unreachable database or an ambiguous match; only its own message tells them
 # apart, so the message is read here. The daily pass removes a row whose entry is gone, and
 # must never remove one merely because the database could not be reached.
+#
+# APROPOS_AMEND_TIMEOUT=<seconds>, set by a turn's repair for this one call, cuts the call off
+# after that long where a coreutils timeout exists (124, which every caller treats as "not
+# settled"). Unset, the call runs to its end, as it always has.
 amend_by_start() {
   if [[ -n "${APROPOS_AMENDER:-}" ]]; then "$APROPOS_AMENDER" "$@"; return $?; fi
   local start="$1" person="$2" desc="$3" expect="${4:-}"
   local script="${APROPOS_SKILL_DIR:-R:/Intranet/ClaudeAI/skills/work-management/time}/Update-TimeDescription.ps1"
   [[ -f "$script" ]] || return 1
   local ps; ps="$(apropos_ps_exe)" || return 1
-  local out rc
+  local out rc to=""
+  local -a cut=()
+  if [[ "${APROPOS_AMEND_TIMEOUT:-}" =~ ^[0-9]+$ ]] && (( APROPOS_AMEND_TIMEOUT > 0 )) && to="$(apropos_timeout_exe)"; then
+    cut=("$to" "$APROPOS_AMEND_TIMEOUT")
+  fi
   if [[ -n "$expect" ]]; then
-    out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+    out="$("${cut[@]}" "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
       -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" -ExpectDescription "$expect" 2>/dev/null)"; rc=$?
   else
-    out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+    out="$("${cut[@]}" "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
       -StartTimeUTC "$start" -Description "$desc" -PersonID "$person" 2>/dev/null)"; rc=$?
   fi
   if [[ "$rc" == "1" ]] && printf '%s\n' "$out" | grep -q '^No entry '; then return 3; fi

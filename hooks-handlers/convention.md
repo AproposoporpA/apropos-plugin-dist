@@ -12,6 +12,8 @@ The flag says which of you got it wrong. `[needs description]` means no descript
 
 If this session started with `APROPOS ALERT: time is not recording in Apropos for the login ...`, tell the user once, plainly, in your first response: their time is being kept on this computer but not yet recorded, and why, as the alert says. Keep writing the files below as usual; the held turns keep their descriptions and are delivered once the login is identified.
 
+If this session started with `APROPOS ALERT: ... flagged time entr...` or `APROPOS: ... left unrepaired by the daily pass`, tell the user once, plainly, in your first response: how many entries, the flag texts to search for in Apropos, and what the line says to do. Never quote or guess at what those entries were.
+
 Before ending each response, write these session-keyed files in `/tmp/claude-timetrack/`:
 - `description-${CLAUDE_CODE_SESSION_ID}.txt` — one specific sentence about this turn. Rewrite every turn. It is screened before it is recorded: second person, a state or verdict rather than an outcome, and internal draft identifiers are refused outright and fall through to a flagged placeholder. Banned dashes and curly quotes are corrected for you.
 - `worktype-${CLAUDE_CODE_SESSION_ID}.txt` — one numeric worktype ID (below). Write it when the category of the work changes. It no longer has to be rewritten every turn: the worktype carries forward, and a turn that writes none takes the one last used on its task before falling back to 13.

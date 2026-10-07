@@ -99,25 +99,80 @@ q_enqueue() {
 # quarantine is that an old entry has probably been delivered already; one with no person
 # can never have been delivered, so retiring it would simply lose the time.
 Q_STALE_DAYS="${Q_STALE_DAYS:-3}"
+# Read like the other settings: a plain number of days, as decimal (08 is 8, not a broken octal
+# number that failed every sum using it), and at least 1, since 0 would retire every line that
+# is not yet a day old. Anything else is the default, 3.
+if [[ "$Q_STALE_DAYS" =~ ^[0-9]{1,6}$ ]] && (( 10#$Q_STALE_DAYS >= 1 )); then Q_STALE_DAYS=$(( 10#$Q_STALE_DAYS )); else Q_STALE_DAYS=3; fi
 
+#
+# ONE PASS, NOT A PROCESS PER LINE. This runs before the flush's first delivery and outside its
+# deadline. It used to run cut and date for every line; at 100 to 200 ms a process on a busy
+# Windows machine, 13 lines took 8 to 10 s (2026-09-30), longer than the delivery window session
+# start leaves itself, so session start delivered nothing, and a backlog of about 50 lines would
+# outlast the hook's 30 s limit in every flush. Now one awk pass compares each start time, in the
+# form the recorder writes (YYYY-MM-DD HH:MM:SS, UTC, or the same with T and Z), with the
+# cut-off written in that form, which orders the same way as comparing the epoch seconds. Only a
+# start time in some other form is still read by date, one line at a time, as before.
+#
+# NOTHING IS MOVED UNLESS THE PASS RAN TO THE END. The kept lines are moved over the queue, so a
+# pass that died partway, after retiring a line, would have moved only the lines it reached and
+# lost the rest (QA, 2026-09-30, from reading the first version of this pass). So awk writes its
+# tagged lines to a working file and ends with a count of them; the queue is rewritten only when
+# awk exited cleanly, its count is there and matches the lines read back, and every kept and
+# retired line was written. Otherwise the queue, and the .stale file, are left exactly as they
+# were, and the next flush checks again. Retired lines are added to .stale only once the rest has
+# succeeded, just before the move.
 q_quarantine_stale() {
-  local qf="$1" cutoff keep stale line start ts moved=0
+  local qf="$1" cutoff cut_str keep stale line tag start ts moved=0 n=0 want="" ok=1 tags newstale
   [[ -f "$qf" ]] || return 0
   cutoff=$(( $(_q_now) - Q_STALE_DAYS * 86400 ))
-  keep="$qf.keep"; stale="$qf.stale"
-  : > "$keep"
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    if [[ "$line" == unresolved:* ]]; then printf '%s\n' "$line" >> "$keep"; continue; fi
-    start="$(printf '%s' "$line" | cut -f6)"
-    ts="$(date -u -d "$start" +%s 2>/dev/null)"
-    if [[ -n "$ts" && "$ts" -lt "$cutoff" ]]; then
-      printf '%s\n' "$line" >> "$stale"; moved=$((moved+1))
-    else
-      printf '%s\n' "$line" >> "$keep"
+  cut_str="$(date -u -d "@$cutoff" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -r "$cutoff" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+  keep="$qf.keep"; stale="$qf.stale"; tags="$qf.tags.$$"; newstale="$qf.stalenew.$$"
+  # Each line comes back tagged: K keep, S stale, or ? followed by its start time, to be read by
+  # date. A line whose person is not identified yet is always kept (see above). The last line is
+  # E and the number of tagged lines before it.
+  if ! awk -F'\t' -v c="$cut_str" '
+    $0 == "" { next }
+    /^unresolved:/ { print "K\t" $0; t++; next }
+    {
+      s = $6; n = s; sub(/Z$/, "", n)
+      if (substr(n, 11, 1) == "T") n = substr(n, 1, 10) " " substr(n, 12)
+      if (c != "" && n ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/)
+        print ((n < c) ? "S" : "K") "\t" $0
+      else
+        print "?\t" s "\t" $0
+      t++
+    }
+    END { print "E\t" (t + 0) }' "$qf" > "$tags" 2>/dev/null; then
+    rm -f "$tags" 2>/dev/null; return 0
+  fi
+  : > "$keep" 2>/dev/null || ok=0
+  : > "$newstale" 2>/dev/null || ok=0
+  while (( ok )) && IFS= read -r line; do
+    tag="${line%%$'\t'*}"; line="${line#*$'\t'}"
+    if [[ "$tag" == E ]]; then want="$line"; continue; fi
+    [[ -z "$want" ]] || { ok=0; break; }   # nothing may follow the count
+    n=$((n+1))
+    if [[ "$tag" == "?" ]]; then
+      start="${line%%$'\t'*}"; line="${line#*$'\t'}"
+      ts="$(date -u -d "$start" +%s 2>/dev/null)"
+      if [[ "$ts" =~ ^-?[0-9]+$ ]] && (( ts < cutoff )); then tag=S; else tag=K; fi
+    elif [[ "$tag" != S && "$tag" != K ]]; then
+      ok=0; break
     fi
-  done < "$qf"
-  if (( moved > 0 )); then mv "$keep" "$qf"; else rm -f "$keep"; fi
+    if [[ "$tag" == S ]]; then
+      printf '%s\n' "$line" >> "$newstale" 2>/dev/null || ok=0; moved=$((moved+1))
+    else
+      printf '%s\n' "$line" >> "$keep" 2>/dev/null || ok=0
+    fi
+  done < "$tags"
+  rm -f "$tags" 2>/dev/null
+  [[ "$want" == "$n" ]] || ok=0
+  if (( ok && moved > 0 )); then
+    if cat "$newstale" >> "$stale" 2>/dev/null; then mv "$keep" "$qf" 2>/dev/null || ok=0; else ok=0; fi
+  fi
+  rm -f "$keep" "$newstale" 2>/dev/null
+  (( ok )) || return 0
   [[ -f "$qf" && ! -s "$qf" ]] && rm -f "$qf"
   return 0
 }

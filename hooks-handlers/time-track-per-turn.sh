@@ -575,6 +575,9 @@ _clean_candidate() {
 # code implemented it, so every turn where the model forgot to write a description
 # booked "[needs description] <project>". On one team machine the working directory
 # is named "Claude", so that put a literal AI reference on an invoice-facing field.
+#
+# Only the live turn uses this, for its own new entry. The repair of an entry already flagged
+# never does (_repair_candidate says why).
 desc_from_transcript() {
   local f raw out
   command -v jq >/dev/null 2>&1 || return 1
@@ -594,12 +597,136 @@ desc_from_transcript() {
   return 1
 }
 
+# WHAT THE SESSION WROTE ITSELF: THE ONLY SOURCE FOR A REPAIR.
+#
+# A flagged entry is filled only with a description its own session wrote and the recorder
+# accepted, for the same task and project, from a turn that started near the flagged entry.
+# Never with text from the session's replies. Until 0.2.11 the repair took a line from the
+# latest reply, and on 2026-10-06 that put a sentence about a table's columns into four entries
+# and a sentence about how a count works into four more. A stricter screen over reply text still
+# let findings through reworded ("Found it: ...", "Saved, and ..."), and of 600 real replies the
+# few it kept were mostly findings. A filled entry reads as finished, so nobody corrects it,
+# while the flag it replaced is visible and gets corrected: a wrong fill is worse than the flag.
+#
+# The description file is consumed at the end of every turn, so the recorder keeps its own
+# record, in the session's own file beside its other files, local like the rest:
+# $TRACK_DIR/described-<session>.tsv, written out in place rather than through a helper, because
+# a command substitution costs a subprocess and the pass asks once per entry. Two kinds of line,
+# tab separated:
+#   D <entry start> <task|project> <description>   a description the session wrote and the
+#                                                   recorder accepted, one per turn, with the
+#                                                   start of the turn it described
+#   F <entry start> <task|project> <worktype>       an entry the session left flagged
+# A description fills only a flagged entry of the same task and project. A session moves between
+# tasks, and often between clients, and a description of one client's work must never fill an
+# entry on another's invoice. An entry whose F line is missing (flagged before this record was
+# kept) is never filled. Nearness is judged by the start of the turn each belongs to, the same
+# measure for both, rather than by when the hook happened to run.
+#
+# APROPOS_REPAIR_WINDOW_SECS (default 7200, two hours) is how far apart, either way, the two
+# starts may be. Within one task a session's description is the best account there is of a turn
+# it did not describe, but only of the work around it: what was being done that morning does not
+# describe the afternoon, and by then the merge cap (APROPOS_MERGE_MAX_SECS, 30 minutes) has
+# closed several entries in between. Two hours covers a working stretch on one task, a long
+# meeting or a lunch break between the flagged turn and the next described one, and no more.
+# 0 means no description is ever near enough, so nothing is filled. A value that is not a whole
+# number of seconds is the default.
+APROPOS_REPAIR_WINDOW_SECS="${APROPOS_REPAIR_WINDOW_SECS:-7200}"
+_sw_num APROPOS_REPAIR_WINDOW_SECS 7200
+
+# _sd_epoch <YYYY-MM-DD HH:MM:SS> - sets SD_E to that UTC time as epoch seconds, or empty and
+# returns 1 when it is not in that form. Worked out in bash (the civil-date day count), because
+# date costs a subprocess and the pass asks this for every line of a session's record.
+_sd_epoch() {
+  SD_E=""
+  [[ "$1" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})\ ([0-9]{2}):([0-9]{2}):([0-9]{2})$ ]] || return 1
+  local y=$(( 10#${BASH_REMATCH[1]} )) m=$(( 10#${BASH_REMATCH[2]} )) d=$(( 10#${BASH_REMATCH[3]} ))
+  local era yoe doy doe
+  (( m <= 2 )) && y=$(( y - 1 ))
+  era=$(( y / 400 )); yoe=$(( y - era * 400 ))
+  doy=$(( (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1 ))
+  doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+  SD_E=$(( (era * 146097 + doe - 719468) * 86400 + 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 + 10#${BASH_REMATCH[6]} ))
+}
+
+# _sd_record <entry start> <task|project> <description> - keep this turn's accepted description.
+# Tabs and line breaks read as spaces. Every failure is swallowed: this is only ever a help to a
+# later repair, never a condition of recording the turn.
+_sd_record() {
+  local d="$3"
+  d="${d//[$'\t\r\n']/ }"; d="${d:0:$DESC_MAX}"
+  [[ -n "${d//[[:space:]]/}" && -n "$1" ]] || return 0
+  _desc_is_placeholder "$d" && return 0
+  printf 'D\t%s\t%s\t%s\n' "$1" "$2" "$d" >> "$TRACK_DIR/described-$SID.tsv" 2>/dev/null || true
+  return 0
+}
+
+# _sd_flag <entry start> <task|project> <worktype> - note the task, project and worktype of an
+# entry this session left flagged: the task and project so its repair can match a description to
+# it, the worktype so the repair can tell when it is still the open entry (_sd_still_open).
+_sd_flag() {
+  printf 'F\t%s\t%s\t%s\n' "$1" "$2" "$3" >> "$TRACK_DIR/described-$SID.tsv" 2>/dev/null || true
+  return 0
+}
+
+# _sd_nearest <session> <entry start> - sets SD_DESC to the description that session wrote for the
+# flagged entry's own task and project, from the turn whose start is nearest the entry's start
+# and no more than APROPOS_REPAIR_WINDOW_SECS from it, the later of two equally near; and SD_ACT
+# to the entry's activity (worktype|task|project), or empty when its worktype was not noted.
+# SD_DESC is empty, returning 1, when there is none, or when the entry's task and project were
+# never noted. Each is screened again, so a line that would not be accepted now is never used.
+# No subprocess.
+_sd_nearest() {
+  SD_DESC=""; SD_ACT=""
+  local f k a b c key="" wt="" best=-1 diff want
+  f="$TRACK_DIR/described-$1.tsv"
+  [[ -s "$f" && -n "${2:-}" ]] || return 1
+  _sd_epoch "$2" || return 1
+  want=$SD_E
+  while IFS=$'\t' read -r k a b c; do
+    [[ "$k" == F && "$a" == "$2" ]] && { key="$b"; wt="$c"; }
+  done < "$f"
+  [[ -n "$key" ]] || return 1
+  [[ "$wt" =~ ^[0-9]+$ ]] && SD_ACT="$wt|$key"
+  while IFS=$'\t' read -r k a b c; do
+    [[ "$k" == D && "$b" == "$key" && -n "${c//[[:space:]]/}" ]] || continue
+    _sd_epoch "$a" || continue
+    diff=$(( SD_E > want ? SD_E - want : want - SD_E ))
+    (( diff <= APROPOS_REPAIR_WINDOW_SECS )) || continue
+    (( best < 0 || diff <= best )) || continue
+    _desc_is_placeholder "$c" && continue
+    _desc_refuse "$c" && continue
+    best=$diff; SD_DESC="$c"
+  done < "$f"
+  [[ -n "$SD_DESC" ]]
+}
+
+# _sd_still_open <activity> - true while the open-entry record (lib/writer.sh) holds an entry for
+# that activity, inside the merge cap, that the recorder last wrote a flag to: most likely the
+# flagged entry itself, still open. A repair leaves such an entry alone. The next turn on that
+# activity amends it by id, expecting the flag; a repair writing first left that amend refused
+# as though a person had corrected the entry, and the turn opened a second entry for the same
+# work. A later turn with a description of its own replaces the flag through that amend anyway,
+# and once the cap has passed nothing continues the entry, so the repair can go ahead then.
+_sd_still_open() {
+  local k i e b now
+  [[ -n "$1" && -s "$APROPOS_OPEN_FILE" ]] || return 1
+  _sw_epoch_now; now="$SW_NOW"
+  while IFS=$'\t' read -r k i e b; do
+    [[ "$k" == "$1" && "$i" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || continue
+    (( now - e <= APROPOS_MERGE_MAX_SECS )) || continue
+    [[ -n "$b" ]] || continue
+    _desc_is_placeholder "$(printf '%s' "$b" | base64 -d 2>/dev/null)" && return 0
+  done < "$APROPOS_OPEN_FILE"
+  return 1
+}
+
 # THE SELF-REPAIR PASS.
 #
 # A flagged entry has no id: fl_record keeps its start time, its session and its cwd
 # (lib/ledger.sh), because that is all record_turn still has when it writes the flag. To
-# repair one later, point desc_from_transcript at that row's own session and cwd rather
-# than the current turn's, and amend the row by start time instead of by id.
+# repair one later, look up what that row's own session wrote (_repair_candidate), and amend
+# the row by start time instead of by id.
 #
 # _flag_text_for_cwd <ph> <cwd> - reconstructs the exact text record_turn would have
 # written for this folder, so the repair pass has something to pass as -ExpectDescription
@@ -619,66 +746,75 @@ _flag_text_for_cwd() {
   printf '%s' "$desc"
 }
 
-# repair_pending [session_filter] - walk the ledger and try to turn a flagged entry's
-# placeholder into a real description, now that its transcript may hold more than it did
-# when the flag was written. Called once a turn for the running session, so a later turn
-# can repair this SAME session's earlier flags, and once a day for the whole ledger, so a
-# session that has already ended still gets cleaned up (see sweep_due below). With no
-# filter, every row is tried; with one, only that session's rows are.
+# How much of the 30 second hook a turn's repair may use, counted from the hook's start. The
+# repair runs last, after the notice and the delivery (the end of this file), and starts a
+# correction only while at least _RP_MIN_LEFT of this is left; where a coreutils timeout exists,
+# the correction in flight is cut off when it runs out. On 2026-10-06 a turn's repair sent four
+# corrections, about three seconds each, before the hook had shown its notice or delivered the
+# turn, with no limit at all. One correction was measured at 3 seconds in ordinary use and 12 to
+# 20 on a slow day, so 15 seconds is several on a good day and still leaves half the hook's
+# limit spare on a bad one. What is not reached waits for the next turn or the daily pass.
+APROPOS_TURN_REPAIR_SECS="${APROPOS_TURN_REPAIR_SECS:-15}"
+_sw_num APROPOS_TURN_REPAIR_SECS 15
+_RP_MIN_LEFT=3
+
+# repair_pending [session_filter] [skip_start] [end] - walk the ledger and try to turn a flagged
+# entry's placeholder into a real description, now that the session may have written one for the
+# same work since. Called once a turn for the running session, so a later turn can repair this
+# SAME session's earlier flags (the daily pass, sweep_run, covers sessions that have ended). With
+# no filter, every row is tried; with one, only that session's rows are. A row starting at
+# skip_start, the calling turn's own, is left alone. With an end, a value of $SECONDS, no
+# correction is started with less than _RP_MIN_LEFT seconds of it left, and the one in flight is
+# cut off at it where a coreutils timeout exists (_ra_timed).
+#
+# Each row leaves the list the moment it is settled, not at the end, so a hook cut off at its
+# limit part way through does not send the rows it had already repaired again.
 #
 # Never invents an attribution: this only ever rewrites a description. A candidate that
 # is empty or is itself a flag is left alone rather than written over a flag, and the row
 # stays pending. Nothing here may cost the turn or the session, so every caller swallows
 # this function's failures; nothing inside it is allowed to propagate either.
 repair_pending() {
-  local _rp_filter="${1:-}"
-  local _rp_start _rp_sess _rp_cwd _rp_epoch _rp_rc
-  local -a _rp_clear=()
-  while IFS=$'\t' read -r _rp_start _rp_sess _rp_cwd _rp_epoch; do
+  local _rp_filter="${1:-}" _rp_skip="${2:-}"
+  local _rp_line _rp_start _rp_sess _rp_cwd _rp_epoch _rp_rc
+  local -a _rp_rows=()
+  # Only for this call: _repair_amend and _ra_timed read them.
+  local SW_LAST_START="" RP_END=""
+  if [[ "${3:-}" =~ ^[0-9]+$ ]]; then RP_END="$3"; SW_LAST_START=$(( RP_END - _RP_MIN_LEFT )); fi
+  # Read whole before any row is cleared, since clearing one rewrites the ledger.
+  while IFS= read -r _rp_line; do _rp_rows+=("$_rp_line"); done < <(fl_pending)
+  for _rp_line in "${_rp_rows[@]}"; do
+    IFS=$'\t' read -r _rp_start _rp_sess _rp_cwd _rp_epoch <<< "$_rp_line"
     [[ -n "$_rp_start" ]] || continue
     [[ -n "$_rp_filter" && "$_rp_sess" != "$_rp_filter" ]] && continue
+    [[ -n "$_rp_skip" && "$_rp_start" == "$_rp_skip" ]] && continue
+    [[ -n "$SW_LAST_START" ]] && (( SECONDS > SW_LAST_START )) && break
 
-    # Nothing usable yet, or the transcript still only yields another flag: leave the row
-    # for the next pass rather than writing a flag over a flag.
-    _repair_candidate "$_rp_sess" "$_rp_cwd"
+    # Nothing the session wrote fills it yet: leave the row for a later turn or pass.
+    _repair_candidate "$_rp_sess" "$_rp_start"
     [[ -n "$RC_CAND" ]] || continue
 
     # 0 amended, 2 the row holds neither flag: a person already corrected it, so it is no
     # longer ours to repair and is cleared rather than retried forever. Any other outcome
-    # (no such row yet, more than one match, the database unreachable) leaves it pending.
+    # (no such row yet, more than one match, the database unreachable, cut off) leaves it.
     _repair_amend "$_rp_start" "$_rp_cwd" "$RC_CAND"; _rp_rc=$?
-    [[ "$_rp_rc" == "0" || "$_rp_rc" == "2" ]] && _rp_clear+=("$_rp_start")
-  done < <(fl_pending)
-  fl_clear_many "${_rp_clear[@]}"
+    [[ "$_rp_rc" == "0" || "$_rp_rc" == "2" ]] && fl_clear "$_rp_start"
+  done
   return 0
 }
 
-# _repair_candidate <session> <cwd> - sets RC_CAND to the description the session's
-# transcript yields for a row of that session and folder, or to nothing when it yields
-# nothing usable or only another flag.
-#
-# Read once per session and folder per run, however many rows share them. The
-# 0.2.9 pass read the whole transcript tail again for every row, and with 30 rows over
-# transcripts of 1 to 5 MB that one step took nearly all of a 17 second pass, inside a
-# start-up budget of about 20. What is derived depends only on the session and folder, so
-# reading once gives every row exactly what it got before, at a fraction of the cost.
-#
-# desc_from_transcript reads the GLOBAL $SID, not an argument, because it derives the
-# transcript path from the session id it was written for. Point it at the row's session
-# for the call, then restore the caller's own so nothing else in the turn is disturbed.
-# Kept in two plain arrays because bash 3.2 (macOS) has no associative arrays.
-_RC_KEYS=(); _RC_VALS=()
+# _repair_candidate <session> <entry start> - sets RC_CAND to the description to fill a flagged
+# row with: the one its session wrote for the same task and project, from the turn that started
+# nearest the row's start, within the window (_sd_nearest). Never anything from the session's
+# replies, on any path (WHAT THE SESSION WROTE ITSELF, above). RC_CAND is empty when there is
+# none: the flag stays, and the row is left for a later turn or pass, or listed in
+# unrepaired.tsv once its session can give nothing more. Also empty, with RC_HELD set, while the
+# row is still the open entry for its activity (_sd_still_open): its next turn will settle it.
 _repair_candidate() {
-  local _rc_k="$1|$2" _rc_i _rc_saved="$SID"
-  for (( _rc_i = 0; _rc_i < ${#_RC_KEYS[@]}; _rc_i++ )); do
-    if [[ "${_RC_KEYS[$_rc_i]}" == "$_rc_k" ]]; then RC_CAND="${_RC_VALS[$_rc_i]}"; return 0; fi
-  done
-  SID="$1"
-  RC_CAND="$(desc_from_transcript "$2" 2>/dev/null)"
-  SID="$_rc_saved"
-  [[ -n "${RC_CAND//[[:space:]]/}" ]] || RC_CAND=""
-  _desc_is_placeholder "$RC_CAND" && RC_CAND=""
-  _RC_KEYS+=("$_rc_k"); _RC_VALS+=("$RC_CAND")
+  RC_CAND=""; RC_HELD=0
+  _sd_nearest "$1" "${2:-}" || return 0
+  if _sd_still_open "$SD_ACT"; then RC_HELD=1; return 0; fi
+  RC_CAND="$SD_DESC"
   return 0
 }
 
@@ -691,14 +827,14 @@ _repair_candidate() {
 # nothing, whenever the row does not hold exactly what was offered as expected. That same
 # guard is why a row is never repaired twice: once amended it no longer holds a flag.
 #
-# Inside the daily pass, SW_LAST_START is the last value of $SECONDS at which a correction may
-# still be started. When the first guess is refused after that, the second is not sent, and
-# this returns 4: nothing was written, and the pass sends only the second guess next time.
-# Outside the pass it is unset and both guesses are always tried, as before.
+# Inside the daily pass, and a turn's repair, SW_LAST_START is the last value of $SECONDS at
+# which a correction may still be started. When the first guess is refused after that, the
+# second is not sent, and this returns 4: nothing was written, and the pass sends only the
+# second guess next time (a turn simply leaves the row). Unset, both guesses are always tried.
 _repair_amend() {
   local _ra_rc
   _flag_text_cached "$DESC_PH_NONE" "$2"
-  amend_by_start "$1" "$PERSON" "$3" "$FT_VAL"; _ra_rc=$?
+  _ra_timed 1 "$1" "$3" "$FT_VAL"; _ra_rc=$?
   [[ "$_ra_rc" == "2" ]] || return "$_ra_rc"
   [[ -n "${SW_LAST_START:-}" ]] && (( SECONDS > SW_LAST_START )) && return 4
   _repair_amend_second "$1" "$2" "$3"
@@ -708,7 +844,29 @@ _repair_amend() {
 # rejected-wording flag.
 _repair_amend_second() {
   _flag_text_cached "$DESC_PH_REJECTED" "$2"
-  amend_by_start "$1" "$PERSON" "$3" "$FT_VAL"
+  _ra_timed 2 "$1" "$3" "$FT_VAL"
+}
+
+# _ra_timed <guess> <start> <candidate> <expected> - one correction call, timed. Appends
+# "guess:code:milliseconds" to RA_TIMES, which the daily pass writes to its log, so how long a
+# real correction takes is measured in ordinary use. Numbers only: nothing else is kept.
+# Inside a turn's repair, RP_END (repair_pending) is the $SECONDS at which the call in flight is
+# cut off, where a coreutils timeout exists (lib/writer.sh amend_by_start). A correction cut off
+# costs nothing: either it had not written, or it had, and the next attempt is refused because
+# the row no longer holds the flag, which takes the row off the list.
+RA_TIMES=""
+_ra_timed() {
+  local _rt_rc _rt_t0 _rt_left
+  _sw_ms_now; _rt_t0=$SW_MS
+  if [[ -n "${RP_END:-}" ]]; then
+    _rt_left=$(( RP_END - SECONDS )); (( _rt_left < 1 )) && _rt_left=1
+    APROPOS_AMEND_TIMEOUT="$_rt_left" amend_by_start "$2" "$PERSON" "$3" "$4"; _rt_rc=$?
+  else
+    amend_by_start "$2" "$PERSON" "$3" "$4"; _rt_rc=$?
+  fi
+  _sw_ms_now
+  RA_TIMES="${RA_TIMES:+$RA_TIMES,}$1:$_rt_rc:$(( SW_MS - _rt_t0 ))"
+  return "$_rt_rc"
 }
 
 # _flag_text_cached <flag> <cwd> - sets FT_VAL to _flag_text_for_cwd's answer, worked out once
@@ -728,12 +886,17 @@ _flag_text_cached() {
 # the stamp file, the resume list, the pass log and the lock, live in lib/ledger.sh, because
 # session start reads the same stamp to report a due pass it had no time to start.
 
-# How long a pending row is worth retrying. Past this, nothing left in the transcript is
+# How long a pending row is worth retrying. Past this, nothing its session writes is
 # going to change, and the row would otherwise sit in the ledger forever, retried on
 # every turn and every day's sweep for no gain.
 APROPOS_SWEEP_DAYS="${APROPOS_SWEEP_DAYS:-7}"
+# Read as a decimal number (lib/ledger.sh has already done so). A value that is not a number is
+# the default, never 0, which would age out every entry at once.
+if [[ "$APROPOS_SWEEP_DAYS" =~ ^[0-9]{1,12}$ ]]; then APROPOS_SWEEP_DAYS=$(( 10#$APROPOS_SWEEP_DAYS )); else APROPOS_SWEEP_DAYS=7; fi
 
-# sweep_prune - drop rows past the window, in one rewrite. Sets SW_PRUNED to the count.
+# sweep_prune - drop rows past the window, in one rewrite, and list each in the person's report
+# of entries left unrepaired (sweep_report_add in lib/ledger.sh), since its entry may still
+# carry the flag. Sets SW_PRUNED to the count.
 sweep_prune() {
   local _sp_cutoff; _sp_cutoff=$(( $(date -u +%s) - APROPOS_SWEEP_DAYS * 86400 ))
   local _sp_start _sp_sess _sp_cwd _sp_epoch
@@ -744,6 +907,7 @@ sweep_prune() {
     (( _sp_epoch < _sp_cutoff )) && _sp_drop+=("$_sp_start")
   done < <(fl_pending)
   SW_PRUNED=${#_sp_drop[@]}
+  sweep_report_add aged-out "${_sp_drop[@]}"
   fl_clear_many "${_sp_drop[@]}"
   return 0
 }
@@ -759,7 +923,8 @@ sweep_prune() {
 # pass paid for them again. Of the 30 rows it held, 24 were one or the other.
 #
 # So the pass now:
-#   - reads each session's transcript once (_repair_candidate), not once per row;
+#   - reads nothing per row that it can read once (a repair now reads no transcript at all,
+#     only the small record of what the session wrote, _repair_candidate);
 #   - records each row as revisited the moment it is settled, or just before its correction
 #     is sent (sweep_visit), so a pass that is cut off, even in the middle of a slow
 #     correction, carries on at the next row at the next session start, and a row is never
@@ -776,10 +941,11 @@ sweep_prune() {
 #   - runs one pass at a time on a machine, and writes one log line as it starts and one as
 #     it ends, with counts only.
 #
-# A row counts as unrecoverable when its session's transcript is missing, or yields nothing
-# usable and has not changed for APROPOS_SWEEP_IDLE_SECS: that session has ended, and the
-# same transcript will give the same nothing tomorrow. A live session keeps its rows; its own
-# turns retry them (repair_pending "$SID" in record_turn), and so does tomorrow's pass.
+# A row counts as unrecoverable when its session's transcript is missing, or it has nothing to
+# fill it with and the transcript has not changed for APROPOS_SWEEP_IDLE_SECS: that session has
+# ended and will write nothing more for it. A live session keeps its rows; its own turns retry
+# them (repair_pending "$SID", at the end of this file), and so does tomorrow's pass. So does a
+# row that is still the open entry for its activity (_sd_still_open).
 #
 # A row counts as gone when the amend script finds no entry at its start time, the entry is
 # not still waiting in this machine's queue, and the flag is older than
@@ -793,17 +959,16 @@ APROPOS_SWEEP_GONE_SECS="${APROPOS_SWEEP_GONE_SECS:-3600}"
 # is sent, so the next start moves on to the next row rather than spending itself on the same
 # one. So this only avoids starting work that cannot finish, and can be shorter than a write.
 APROPOS_SWEEP_AMEND_SECS="${APROPOS_SWEEP_AMEND_SECS:-10}"
-[[ "$APROPOS_SWEEP_IDLE_SECS" =~ ^[0-9]+$ ]] || APROPOS_SWEEP_IDLE_SECS=43200
-[[ "$APROPOS_SWEEP_GONE_SECS" =~ ^[0-9]+$ ]] || APROPOS_SWEEP_GONE_SECS=3600
-[[ "$APROPOS_SWEEP_AMEND_SECS" =~ ^[0-9]+$ ]] || APROPOS_SWEEP_AMEND_SECS=10
+# Read as decimal numbers, so a value written with a leading zero is not taken for octal.
+_sw_num APROPOS_SWEEP_IDLE_SECS 43200
+_sw_num APROPOS_SWEEP_GONE_SECS 3600
+_sw_num APROPOS_SWEEP_AMEND_SECS 10
 
 # _sweep_unrecoverable <session> <cwd> - true when the row's transcript is missing or idle.
-# Answered once per session and folder, like the candidate.
-#
-# "Idle" counts only where jq is present. Without it desc_from_transcript cannot read a
-# transcript at all, so an empty candidate says nothing about what the transcript holds, and
-# the row is kept for a computer, or a day, that can judge it. A missing transcript needs no
-# jq to judge: nothing will ever repair that row.
+# Answered once per session and folder. The transcript is asked only whether the session is
+# still running, never for a description, so this needs no jq. Until the repair stopped reading
+# transcripts, an idle session's rows were kept on a computer without jq, which could not read
+# one; now they need not be.
 _SU_KEYS=(); _SU_VALS=()
 _sweep_unrecoverable() {
   local _su_k="$1|$2" _su_i _su_f _su_mins _su_v=1
@@ -812,7 +977,7 @@ _sweep_unrecoverable() {
   done
   if ! _su_f="$(transcript_path "$1" "$2")"; then
     _su_v=0
-  elif command -v jq >/dev/null 2>&1; then
+  else
     _su_mins=$(( APROPOS_SWEEP_IDLE_SECS / 60 ))
     [[ -n "$(find "$_su_f" -maxdepth 0 -mmin +"$_su_mins" 2>/dev/null)" ]] && _su_v=0
   fi
@@ -842,14 +1007,24 @@ sweep_run() {
   # the pass is killed first. A kill that beats even this loses nothing: each row is already
   # on today's revisited list, and tomorrow's attempt is refused because it no longer holds a
   # flag, which removes it then.
-  local -a _sw_clear=()
-  trap 'fl_clear_many "${_sw_clear[@]}"; sweep_log "end result=killed"; sweep_unlock; exit 143' TERM INT
+  # Rows found no longer in Apropos leave the list the same way, and go in the person's report
+  # of entries left unrepaired, as gone, at the same moment.
+  local -a _sw_clear=() _sw_gone=()
+  local _sw_res=""
+  # Stopped by the hard limit (TERM), by an interrupt (INT), or by the terminal it was started
+  # from going away (HUP, as when the program is closed): it says so in the log, keeps what it
+  # has settled, and releases its lock, so the next start carries on at once.
+  local _sw_stop='sweep_report_add gone "${_sw_gone[@]}"; fl_clear_many "${_sw_clear[@]}"; sweep_log "end result=killed"; sweep_unlock; [[ -n "$_sw_res" ]] && rm -rf "$_sw_res" 2>/dev/null'
+  trap "$_sw_stop; exit 143" TERM
+  trap "$_sw_stop; exit 130" INT
+  trap "$_sw_stop; exit 129" HUP
 
   # Clock kept with bash's own counter, so checking it costs no subprocess per row.
   local _sw_t0=$SECONDS _sw_e0 _sw_deadline="${APROPOS_SWEEP_DEADLINE:-}"
   _sw_e0="$(date -u +%s)"
-  [[ "$_sw_deadline" =~ ^[0-9]+$ ]] || _sw_deadline=""
-  SW_TODAY="$(_sw_today)"
+  if [[ "$_sw_deadline" =~ ^[0-9]{1,12}$ ]]; then _sw_deadline=$(( 10#$_sw_deadline )); else _sw_deadline=""; fi
+  # The pass's day is the local date, as sweep_due and the working days are (lib/ledger.sh).
+  _sw_local_day; SW_TODAY="$SW_DAY"
   sweep_log "start deadline_in=${_sw_deadline:+$(( _sw_deadline - _sw_e0 ))s}"
 
   SW_PRUNED=0
@@ -877,9 +1052,9 @@ sweep_run() {
     if [[ -n "$_sw_deadline" ]] && (( _sw_e0 + SECONDS - _sw_t0 >= _sw_deadline )); then
       _sw_stopped=1; _sw_waiting=$(( _sw_waiting + 1 )); continue
     fi
-    _repair_candidate "$_sw_sess" "$_sw_cwd"
+    _repair_candidate "$_sw_sess" "$_sw_start"
     if [[ -z "$RC_CAND" ]]; then
-      if _sweep_unrecoverable "$_sw_sess" "$_sw_cwd"; then
+      if (( ! RC_HELD )) && _sweep_unrecoverable "$_sw_sess" "$_sw_cwd"; then
         _sw_retire+=("$_sw_start"); _sw_removed=$(( _sw_removed + 1 ))
       else
         _sw_kept=$(( _sw_kept + 1 ))
@@ -893,6 +1068,9 @@ sweep_run() {
       _sw_cs+=("$_sw_start"); _sw_cc+=("$_sw_cwd"); _sw_ct+=("$RC_CAND"); _sw_ce+=("$_sw_epoch"); _sw_cm+=("$_sw_mode")
     fi
   done < <(fl_pending)
+  # Rows whose session can never give them a description leave the list unrepaired, so their
+  # entries may still carry the flag: they go in the person's report, like rows that aged out.
+  sweep_report_add no-description "${_sw_retire[@]}"
   fl_clear_many "${_sw_retire[@]}"
   for (( _sw_i = 0; _sw_i < ${#_sw_rs[@]}; _sw_i++ )); do
     _sw_cs+=("${_sw_rs[$_sw_i]}"); _sw_cc+=("${_sw_rc2[$_sw_i]}"); _sw_ct+=("${_sw_rt[$_sw_i]}"); _sw_ce+=("${_sw_re[$_sw_i]}"); _sw_cm+=("${_sw_rm[$_sw_i]}")
@@ -903,69 +1081,126 @@ sweep_run() {
   # finish one. SW_LAST_START is the last $SECONDS at which a correction, or a row's second
   # flag guess (_repair_amend), may still be started: APROPOS_SWEEP_AMEND_SECS before the
   # deadline. Each row is recorded before its correction is sent (sweep_visit explains why).
+  #
+  # Up to APROPOS_SWEEP_WORKERS corrections are sent at once, a round at a time: a correction
+  # is a PowerShell start and a database round trip, mostly waiting, and one at a time a slow
+  # one (20 seconds) made a list of 40 take 13 minutes. Each correction runs in its own subshell
+  # and writes only its own result file; everything else, the visited marks, the counts and the
+  # log, is written here, by this process alone, so no file is ever written by two at once.
+  # Before each round the pass checks it still holds the lock, and stops if another pass has
+  # taken it over (sweep_lock_held in lib/ledger.sh).
   local SW_LAST_START=""
   [[ -n "$_sw_deadline" ]] && SW_LAST_START=$(( _sw_t0 + _sw_deadline - _sw_e0 - APROPOS_SWEEP_AMEND_SECS ))
+  local _sw_w="${APROPOS_SWEEP_WORKERS:-4}" _sw_b _sw_j _sw_end _sw_times _sw_t _sw_calls=0 _sw_slow=0 _sw_ms _sw_super=0 _sw_rc4=0
+  local -a _sw_tl=()
+  if [[ "$_sw_w" =~ ^[0-9]{1,6}$ ]]; then _sw_w=$(( 10#$_sw_w )); else _sw_w=4; fi
+  (( _sw_w < 1 )) && _sw_w=1
+  (( _sw_w > 8 )) && _sw_w=8
+  _sw_res="$(mktemp -d 2>/dev/null)" || _sw_res=""
+  [[ -n "$_sw_res" && -d "$_sw_res" ]] || _sw_w=0
   _sw_n=${#_sw_cs[@]}
+  # Worked out here, once per folder, so every subshell inherits it rather than working it out
+  # again (it costs several subprocesses).
   for (( _sw_i = 0; _sw_i < _sw_n; _sw_i++ )); do
+    _flag_text_cached "$DESC_PH_NONE" "${_sw_cc[$_sw_i]}"; _flag_text_cached "$DESC_PH_REJECTED" "${_sw_cc[$_sw_i]}"
+  done
+  _sw_i=0
+  while (( _sw_i < _sw_n )); do
+    if (( _sw_w == 0 )); then _sw_stopped=1; _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i )); break; fi
     if [[ -n "$SW_LAST_START" ]] && (( SECONDS > SW_LAST_START )); then
       _sw_stopped=1; _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i )); break
     fi
-    _sw_start="${_sw_cs[$_sw_i]}"; _sw_mode="${_sw_cm[$_sw_i]}"
-    case "$_sw_mode" in
-      0) sweep_visit "$_sw_start" tried ;;
-      1) sweep_visit "$_sw_start" tried-second ;;
-      *) sweep_visit "$_sw_start" ;;
-    esac
-    if (( _sw_mode == 1 || _sw_mode == 3 )); then
-      _repair_amend_second "$_sw_start" "${_sw_cc[$_sw_i]}" "${_sw_ct[$_sw_i]}"; _sw_rc=$?
-    else
-      _repair_amend "$_sw_start" "${_sw_cc[$_sw_i]}" "${_sw_ct[$_sw_i]}"; _sw_rc=$?
+    if ! sweep_lock_held; then
+      _sw_stopped=1; _sw_super=1; _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i )); break
     fi
-    (( _sw_mode >= 2 )) || [[ "$_sw_rc" == "4" ]] || sweep_visit "$_sw_start"
-    case "$_sw_rc" in
-      4)
-        # The first guess was refused and there is no time for the second: nothing was
-        # written. The next pass sends this row the second guess only; a retry is already
-        # recorded as done for today, and waits for tomorrow.
-        if (( _sw_mode >= 2 )); then
-          _sw_kept=$(( _sw_kept + 1 )); _sw_done=$(( _sw_done + 1 ))
-          (( _sw_i + 1 < _sw_n )) && _sw_stopped=1
-          _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i - 1 ))
+    _sw_end=$(( _sw_i + _sw_w )); (( _sw_end > _sw_n )) && _sw_end=$_sw_n
+    for (( _sw_j = _sw_i; _sw_j < _sw_end; _sw_j++ )); do
+      case "${_sw_cm[$_sw_j]}" in
+        0) sweep_visit "${_sw_cs[$_sw_j]}" tried ;;
+        1) sweep_visit "${_sw_cs[$_sw_j]}" tried-second ;;
+        *) sweep_visit "${_sw_cs[$_sw_j]}" ;;
+      esac
+    done
+    for (( _sw_j = _sw_i; _sw_j < _sw_end; _sw_j++ )); do
+      (
+        RA_TIMES=""
+        if (( ${_sw_cm[$_sw_j]} == 1 || ${_sw_cm[$_sw_j]} == 3 )); then
+          _repair_amend_second "${_sw_cs[$_sw_j]}" "${_sw_cc[$_sw_j]}" "${_sw_ct[$_sw_j]}"; _sw_b=$?
         else
-          sweep_visit "$_sw_start" second
-          _sw_stopped=1; _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i ))
+          _repair_amend "${_sw_cs[$_sw_j]}" "${_sw_cc[$_sw_j]}" "${_sw_ct[$_sw_j]}"; _sw_b=$?
         fi
-        break
-        ;;
-      0) _sw_clear+=("$_sw_start"); _sw_repaired=$(( _sw_repaired + 1 )) ;;
-      2)
-        # Refused: the entry no longer holds a flag. On a retry that is the cut-off
-        # correction having landed, so it counts as repaired; otherwise the entry was
-        # corrected some other way, and simply leaves the list.
-        _sw_clear+=("$_sw_start")
-        if (( _sw_mode >= 2 )); then _sw_repaired=$(( _sw_repaired + 1 )); else _sw_removed=$(( _sw_removed + 1 )); fi
-        ;;
-      3)
-        _sw_now=$(( _sw_e0 + SECONDS - _sw_t0 ))
-        if [[ "${_sw_ce[$_sw_i]}" =~ ^[0-9]+$ ]] && (( _sw_now - ${_sw_ce[$_sw_i]} > APROPOS_SWEEP_GONE_SECS )) && ! _sweep_queued "$_sw_start"; then
-          _sw_clear+=("$_sw_start"); _sw_removed=$(( _sw_removed + 1 ))
-        else
-          _sw_kept=$(( _sw_kept + 1 ))
-        fi
-        ;;
-      *) _sw_kept=$(( _sw_kept + 1 )) ;;
-    esac
-    _sw_done=$(( _sw_done + 1 ))
+        printf '%s %s\n' "$_sw_b" "$RA_TIMES" > "$_sw_res/$_sw_j"
+      ) </dev/null >/dev/null 2>&1 &
+    done
+    wait
+    for (( _sw_j = _sw_i; _sw_j < _sw_end; _sw_j++ )); do
+      _sw_start="${_sw_cs[$_sw_j]}"; _sw_mode="${_sw_cm[$_sw_j]}"
+      _sw_rc=1; _sw_times=""
+      { read -r _sw_rc _sw_times < "$_sw_res/$_sw_j"; } 2>/dev/null
+      [[ "$_sw_rc" =~ ^[0-9]+$ ]] || _sw_rc=1
+      rm -f "$_sw_res/$_sw_j" 2>/dev/null
+      # One log line per call: which guess, its code and how long it took. Numbers only.
+      _sw_tl=(); [[ -n "$_sw_times" ]] && IFS=',' read -r -a _sw_tl <<< "$_sw_times"
+      for _sw_t in "${_sw_tl[@]}"; do
+        [[ "$_sw_t" =~ ^([12]):([0-9]+):([0-9]+)$ ]] || continue
+        _sw_ms="${BASH_REMATCH[3]}"
+        sweep_log "amend guess=${BASH_REMATCH[1]} rc=${BASH_REMATCH[2]} ms=$_sw_ms"
+        _sw_calls=$(( _sw_calls + 1 )); (( _sw_ms > _sw_slow )) && _sw_slow=$_sw_ms
+      done
+      (( _sw_mode >= 2 )) || [[ "$_sw_rc" == "4" ]] || sweep_visit "$_sw_start"
+      case "$_sw_rc" in
+        4)
+          # The first guess was refused and there is no time for the second: nothing was
+          # written. The next pass sends this row the second guess only; a retry is already
+          # recorded as done for today, and waits for tomorrow.
+          if (( _sw_mode >= 2 )); then
+            _sw_kept=$(( _sw_kept + 1 )); _sw_done=$(( _sw_done + 1 ))
+          else
+            sweep_visit "$_sw_start" second
+            _sw_rc4=1; _sw_waiting=$(( _sw_waiting + 1 ))
+          fi
+          continue
+          ;;
+        0) _sw_clear+=("$_sw_start"); _sw_repaired=$(( _sw_repaired + 1 )) ;;
+        2)
+          # Refused: the entry no longer holds a flag. On a retry that is the cut-off
+          # correction having landed, so it counts as repaired; otherwise the entry was
+          # corrected some other way, and simply leaves the list.
+          _sw_clear+=("$_sw_start")
+          if (( _sw_mode >= 2 )); then _sw_repaired=$(( _sw_repaired + 1 )); else _sw_removed=$(( _sw_removed + 1 )); fi
+          ;;
+        3)
+          _sw_now=$(( _sw_e0 + SECONDS - _sw_t0 ))
+          if [[ "${_sw_ce[$_sw_j]}" =~ ^[0-9]+$ ]] && (( _sw_now - ${_sw_ce[$_sw_j]} > APROPOS_SWEEP_GONE_SECS )) && ! _sweep_queued "$_sw_start"; then
+            _sw_clear+=("$_sw_start"); _sw_gone+=("$_sw_start"); _sw_removed=$(( _sw_removed + 1 ))
+          else
+            _sw_kept=$(( _sw_kept + 1 ))
+          fi
+          ;;
+        *) _sw_kept=$(( _sw_kept + 1 )) ;;
+      esac
+      _sw_done=$(( _sw_done + 1 ))
+    done
+    _sw_i=$_sw_end
+    # Out of time for second guesses means out of time: the rest wait for the next pass.
+    if (( _sw_rc4 )); then
+      (( _sw_i < _sw_n )) && _sw_waiting=$(( _sw_waiting + _sw_n - _sw_i ))
+      _sw_stopped=1; break
+    fi
   done
+  [[ -n "$_sw_res" ]] && rm -rf "$_sw_res" 2>/dev/null
+  local _sw_gone_n=${#_sw_gone[@]}
+  sweep_report_add gone "${_sw_gone[@]}"; _sw_gone=()
   fl_clear_many "${_sw_clear[@]}"; _sw_clear=()
 
   local _sw_result=deadline
+  (( _sw_super )) && _sw_result=superseded
   if (( ! _sw_stopped && _sw_waiting == 0 )); then
     sweep_mark; sweep_visited_reset; _sw_result=complete
   fi
-  sweep_log "end result=$_sw_result entries=$_sw_rows revisited=$_sw_done earlier=$_sw_earlier repaired=$_sw_repaired removed=$_sw_removed kept=$_sw_kept remaining=$_sw_waiting aged_out=$SW_PRUNED scan_secs=$_sw_scan secs=$(( SECONDS - _sw_t0 ))"
+  sweep_log "end result=$_sw_result entries=$_sw_rows revisited=$_sw_done earlier=$_sw_earlier repaired=$_sw_repaired removed=$_sw_removed kept=$_sw_kept remaining=$_sw_waiting aged_out=$SW_PRUNED unrepairable=${#_sw_retire[@]} gone=$_sw_gone_n workers=$_sw_w calls=$_sw_calls slowest_ms=$_sw_slow scan_secs=$_sw_scan secs=$(( SECONDS - _sw_t0 ))"
   sweep_log_trim
-  trap - TERM INT
+  trap - TERM INT HUP
   sweep_unlock
   return 0
 }
@@ -1026,6 +1261,10 @@ _tw_lock() {
   return 1
 }
 
+# The start of the turn record_turn has just recorded, whose session's earlier flags the end of
+# this file then revisits. Empty when there is no person to repair for.
+RT_REPAIR_SKIP=""
+
 record_turn() {
   # $1 = start time as UTC "YYYY-MM-DD HH:MM:SS"
   local START="$1"
@@ -1041,6 +1280,8 @@ record_turn() {
   # is the entire defect: the two causes of a flagged entry became indistinguishable in
   # the record. Carried to the placeholder rather than stored anywhere new.
   local REFUSED=0
+  # Whether this turn's description is one the session wrote and the screen accepted.
+  local WROTE=0
   if [[ -s "$descf" ]]; then
     DESC="$(_desc_normalise "$(cat "$descf")")"
     # A supplied description is held to the same standard as a derived one. Refusing it
@@ -1050,6 +1291,10 @@ record_turn() {
       printf 'apropos: the description written this turn reads as a reply rather than a record of the work, so it was not used. Rewrite it in the past tense, from your own perspective, saying what was accomplished.\n' >&2
       DESC=""
       REFUSED=1
+    else
+      # Accepted, so the session's own words: kept below, once the task is known, for the
+      # repair of this session's flagged entries on the same task (_sd_record).
+      WROTE=1
     fi
   fi
   local basecwd="$CWD"
@@ -1085,13 +1330,6 @@ record_turn() {
   fi
   DESC="${DESC:0:$DESC_MAX}"
 
-  # Now that this turn's own description is settled, take the chance to revisit any flag
-  # THIS session left behind earlier. Its transcript holds more now than it did when the
-  # flag was written, so a candidate that did not exist then might exist now. Never
-  # allowed to cost the turn: every failure inside is swallowed.
-  # Needs the person, since every repair is scoped to one person's rows.
-  [[ -n "$PERSON" ]] && { repair_pending "$SID" 2>/dev/null || true; }
-
   # Optional sticky task/project. Resolved BEFORE the worktype, because the worktype can
   # be inherited from the task.
   local TASK="0"; [[ -s "$taskf" ]] && TASK="$(tr -d '[:space:]#' < "$taskf")"; [[ "$TASK" =~ ^[0-9]+$ ]] || TASK="0"
@@ -1102,6 +1340,11 @@ record_turn() {
   # would otherwise have become somebody else's invoice.
   if [[ "$TASK" == "0" && -n "$_dir_task" ]]; then TASK="$_dir_task"; fi
   if [[ "$PROJ" == "0" && -n "$_dir_proj" ]]; then PROJ="$_dir_proj"; fi
+
+  # A description the session wrote and the screen accepted is kept, with its task and
+  # project, so it can fill this session's flagged entries on the same work (_sd_record).
+  # Before the repair that ends the hook, so this turn's description can fill them.
+  (( WROTE )) && _sd_record "$START" "$TASK|$PROJ" "$DESC"
 
   # ...and when nothing answers, say so. Until now this was the silent path: TASK stayed 0,
   # the writer applied the person's fallback task, and the first anyone knew was reading
@@ -1333,12 +1576,13 @@ record_turn() {
       notice_add "$_held_msg"
       printf 'apropos: %s\n' "$_held_msg" >&2
     fi
-    # A flagged entry is remembered so a later turn, or the daily sweep, can try again with
-    # the transcript as it finally stands. Keyed on the start time because the entry has no
-    # id yet: this call only enqueues, and the id is parsed later inside write_entry, which
-    # knows nothing about the session or the directory.
+    # A flagged entry is remembered so a later turn, or the daily sweep, can fill it with a
+    # description the session writes later for the same work. Keyed on the start time because
+    # the entry has no id yet: this call only enqueues, and the id is parsed later inside
+    # write_entry, which knows nothing about the session or the directory.
     if _desc_is_placeholder "$DESC"; then
       fl_record "$START" "$SID" "$basecwd" "$(date -u +%s)" || true
+      _sd_flag "$START" "$TASK|$PROJ" "$WT"
     fi
     printf '%s|%s\n' "$NOW" "$SEG" > "$lastf"
     # The day's tally, written HERE rather than beside the catch-all announcement,
@@ -1390,6 +1634,12 @@ record_turn() {
   [[ "$WTSRC" != "default" ]] && task_wt_record "$TASK" "$WT"
 
   rm -f "$descf" "$wtf" 2>/dev/null || true
+
+  # This session's earlier flags are revisited once the hook has done everything else (the end
+  # of this file). Needs the person, since every repair is scoped to one person's rows. The
+  # turn's own new flag, not yet delivered, is skipped.
+  [[ -n "$PERSON" ]] && RT_REPAIR_SKIP="$START"
+  return 0
 }
 
 case "$EVENT" in
@@ -1408,7 +1658,13 @@ case "$EVENT" in
     # sourcing it would exit session-init.sh's own hook too. sweep_due keeps this to once
     # per machine per day even though every concurrent session's start asks for it, and
     # sweep_run resumes a pass an earlier start did not finish.
+    #
+    # Session start runs this in the background, so it ends here, without the queue flush a
+    # turn ends with: deliveries are the turns' and session start's own work, bounded by their
+    # time limits, and a background delivery racing them would only change which of them sends
+    # an entry.
     sweep_run
+    exit 0
     ;;
   *)
     # UserPromptSubmit. Recovery first: a leftover description file means Stop did
@@ -1450,4 +1706,25 @@ if [[ "${APROPOS_FLUSH_DEADLINE:-}" =~ ^[0-9]+$ ]] && (( APROPOS_FLUSH_DEADLINE 
   _tf_deadline="$APROPOS_FLUSH_DEADLINE"
 fi
 APROPOS_FLUSH_DEADLINE="$_tf_deadline" q_flush "$QUEUE" write_entry
+
+# Last of all, revisit this session's earlier flags (record_turn sets RT_REPAIR_SKIP to the
+# turn's own start, which is skipped). A description the session has written since a flag, for
+# the same task and project, may fill it now.
+#
+# Last because it matters least: the turn's own entry, its notice and the queued deliveries all
+# come first. On 2026-10-06 a turn's repair ran before the notice and the delivery, with no time
+# limit, and four corrections in a row took it to the hook's limit; a hook cut off there shows
+# nothing and delivers nothing. So it runs here, starting no correction once
+# APROPOS_TURN_REPAIR_SECS of the hook (counted from its start) are nearly used, and taking each
+# row off the list as it is repaired. When the flush or the turn's own work has used that time,
+# it does nothing, and the next turn or the daily pass carries on.
+#
+# After the turn's own entry for a second reason. Run before the merge, a repair that filled the
+# open entry's flag left the merge expecting the flag: its amend was refused as though a person
+# had corrected the entry, and the turn opened a second entry for the same work. And it leaves
+# alone an entry still open with a flag under another worktype of the same task, for the same
+# reason (_sd_still_open).
+if [[ -n "$RT_REPAIR_SKIP" ]]; then
+  repair_pending "$SID" "$RT_REPAIR_SKIP" "$APROPOS_TURN_REPAIR_SECS" 2>/dev/null || true
+fi
 exit 0
