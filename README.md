@@ -109,7 +109,7 @@ A small file at the top of a folder tells the plugin where the time spent in tha
 - `.apropos-project` holding a project number, for work that belongs to a project rather than a task. The nearest one wins.
 - `.apropos-notime` to record nothing, for example for scheduled runs. Only its presence counts, so it can be empty. It outranks everything: if one is in the working folder or in any folder above it, nothing is recorded, even when a nearer folder has an `.apropos-task` or `.apropos-project` file and even when the session names a task.
 
-Apart from `.apropos-notime`, a task named in the session takes priority over a folder marker. When neither is given, the entry records against your catch-all task and the plugin tells you so.
+Apart from `.apropos-notime`, a task named in the session takes priority over a folder marker. Each session is told at start to write the task it is working on in the turn the task becomes known, and to rewrite it when the work moves to another task. The plugin never works out a task from what a turn did: a task that was only read, changed, mentioned or committed for is not used unless the session names it. When neither a task nor a marker is given, the entry records against your catch-all task, and you are shown the day's catch-all entries, each with its local start time and description.
 
 ## Security
 

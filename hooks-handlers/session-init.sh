@@ -83,13 +83,21 @@ if [[ -d "$CATCHALL_DIR" ]]; then
   # The recorder's tally of withheld flags is kept for the same week.
   find "$CATCHALL_DIR" -maxdepth 1 \( -name 'catchall-*.tsv' -o -name 'withheld-flags-*.tsv' \) -mtime +7 -delete 2>/dev/null || true
 fi
+# The entries themselves are listed, each with its local start time and description, oldest
+# first, because a count and a list of folders did not say which hours to go and fix.
+# Every entry of the day is listed, up to a hundred, and none is shortened: this is the one place
+# the whole day is shown at once.
 if [[ -s "$CATCHALL_TODAY" ]]; then
   n=$(grep -c . "$CATCHALL_TODAY" 2>/dev/null || echo 0)
   if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
     echo ""
-    echo "APROPOS: $n time entr(y/ies) today went to your catch-all task because no task was stated and no .apropos-task marker was found. Client work booked as internal overhead under-bills the customer and misreports the day, so correct these before the day closes. The folders they came from:"
-    awk -F'	' '{print $2}' "$CATCHALL_TODAY" 2>/dev/null | sort -u | sed 's/^/  - /'
-    echo "  Put a .apropos-task file holding the task number at the top of a folder and everything under it attributes itself."
+    if [[ -n "$P" && -f "$P/hooks-handlers/lib/catchall.sh" ]] && source "$P/hooks-handlers/lib/catchall.sh" \
+       && catchall_list "$CATCHALL_TODAY" 100 $'\n  - ' "APROPOS: " $'\n  - ' "" 0; then
+      echo ""
+    else
+      echo "APROPOS: $n time entr(y/ies) today went to your catch-all task because no task was set for that work. They are listed in $CATCHALL_TODAY."
+    fi
+    echo "  Client work booked as internal overhead under-bills the customer and misreports the day, so move these to the right task before the day closes. Set the session's task when the work is known, or put a .apropos-task file holding the task number at the top of a folder and everything under it attributes itself."
   fi
 fi
 

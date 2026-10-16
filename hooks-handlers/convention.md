@@ -17,7 +17,7 @@ If this session started with `APROPOS ALERT: ... flagged time entr...` or `APROP
 Before ending each response, write these session-keyed files in `/tmp/claude-timetrack/`:
 - `description-${CLAUDE_CODE_SESSION_ID}.txt` — one specific sentence about this turn. Rewrite every turn. It is screened before it is recorded: second person, a state or verdict rather than an outcome, and internal draft identifiers are refused outright and fall through to a flagged placeholder. Banned dashes and curly quotes are corrected for you.
 - `worktype-${CLAUDE_CODE_SESSION_ID}.txt` — one numeric worktype ID (below). Write it when the category of the work changes. It no longer has to be rewritten every turn: the worktype carries forward, and a turn that writes none takes the one last used on its task before falling back to 13.
-- `task-${CLAUDE_CODE_SESSION_ID}.txt` — task display ID (strip `#`). Sticky; write once when known.
+- `task-${CLAUDE_CODE_SESSION_ID}.txt` — the display ID of the task this work is for (strip `#`). Sticky: write it in the same turn the task becomes known, and rewrite it in the turn the work moves to another task (rules 9 to 13).
 - `project-${CLAUDE_CODE_SESSION_ID}.txt` — Apropos project ID. Sticky; use when no task.
 
 ### Description rules — these land on client invoices
@@ -32,8 +32,12 @@ Before ending each response, write these session-keyed files in `/tmp/claude-tim
 
 ### Attribution rules
 
-8. **Always attribute.** Every entry should carry a task (or at minimum a project) plus a worktype. An entry with no task and no project is a defect that has to be redone by hand.
-9. **When the turn's work moves to a different client or project, change the sticky task/project file before the turn ends.** Leaving the previous task sticky bills that client for unrelated work.
+8. **Always attribute.** Every entry should carry a task (or at minimum a project) plus a worktype. An entry with no task and no project goes to the person's catch-all task, and every one of those has to be found and moved by hand before billing.
+9. **Identify the task from the work itself, and write it that turn.** The task is known when the person names it for this work, when you read or change it (look it up, set its status or fields, post to it, estimate it), when you are dispatched to work on it, or when the branch or commit you make carries its number. Write the task file before that turn ends. Do not wait to be told again, and do not leave it for a later turn.
+10. **A task that is only mentioned is not the task.** A number said in passing, a related task you read only for reference, or a follow-up you file for later does not move the time. When in doubt between two tasks, keep the one the work is for.
+11. **When the work moves to a different task, client or project, rewrite the task (or project) file in that turn.** Leaving the previous task sticky bills that client for unrelated work.
+12. **When the work is plainly for a client and no task is known, ask once** which task it belongs to, in one short line at the end of your reply, then write it. Internal work with no task of its own may stay on the catch-all.
+13. **If no task or project is written and no folder marker applies, the turn goes to the catch-all**, and the person is shown it in the day's list of catch-all entries. The recorder does not work out a task from what the turn did: only the task file, the project file or a folder marker attributes a turn, so a turn on a task you did not write is not booked to that task. A turn may start with a note, for you, that no task is set. When it does, write the task file if the work belongs to a task, and do not mention the note.
 
 Worktype IDs: 7 Program Management | 13 Engineering | 18 Project Management | 19 Quality Assurance | 23 Documentation | 30 Support | 31 Estimate | 32 Training: General | 48 Admin: Business Development | 50 Architecture | 56 Admin: HR | 57 Admin: Finance | 58 Admin: Marketing | 59 Admin: Operations | 66 Office Festivities | 80 Product Management | 84 Sys Admin | 86 Testing: ALPHA | 87 Configuration | 91 Copywriting | 92 Database | 93 Design | 97 Front End Development | 102 Research & Development | 108 Technical Management | 109 Testing: BETA | 110 Testing: Browser | 117 Travel.
 

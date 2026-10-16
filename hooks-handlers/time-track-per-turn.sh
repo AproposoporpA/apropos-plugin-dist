@@ -38,20 +38,33 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec 3>&1 1>/dev/null
 APROPOS_NOTICE=""
 notice_add() { APROPOS_NOTICE="${APROPOS_NOTICE:+$APROPOS_NOTICE }$1"; }
-notice_emit() {
-  [[ -n "$APROPOS_NOTICE" ]] || return 0
-  local s="$APROPOS_NOTICE" bs dq
+# What the SESSION is told, on a prompt only: hookSpecificOutput.additionalContext, which Claude
+# Code adds to the session's context beside the prompt and does not show the person.
+APROPOS_CONTEXT=""
+_json_str() {
+  local s="$1" bs dq
   bs="$(printf '\134')"; dq='"'     # a backslash and a double quote, the two JSON escapes
   s="${s//"$bs"/"$bs$bs"}"; s="${s//"$dq"/"$bs$dq"}"
   s="${s//$'\t'/ }"; s="${s//$'\r'/ }"; s="${s//$'\n'/ }"
   # Any other control character is not allowed raw in a JSON string. The login is already
   # cleaned (apropos_login); this covers whatever else reaches the notice.
   s="$(printf '%s' "$s" | tr -d '\000-\037\177')"
-  printf '{"systemMessage":"%s"}\n' "$s" >&3
+  printf '%s' "$s"
+}
+notice_emit() {
+  [[ -n "$APROPOS_NOTICE" || -n "$APROPOS_CONTEXT" ]] || return 0
+  local out=""
+  [[ -n "$APROPOS_NOTICE" ]] && out="\"systemMessage\":\"$(_json_str "$APROPOS_NOTICE")\""
+  if [[ -n "$APROPOS_CONTEXT" && "$EVENT" == "UserPromptSubmit" ]]; then
+    out="${out:+$out,}\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"$(_json_str "$APROPOS_CONTEXT")\"}"
+  fi
+  [[ -n "$out" ]] && printf '{%s}\n' "$out" >&3
+  return 0
 }
 source "$HERE/lib/queue.sh"
 source "$HERE/lib/writer.sh"
 source "$HERE/lib/ledger.sh"
+source "$HERE/lib/catchall.sh"
 
 TRACK_DIR="${APROPOS_TRACK_DIR:-/tmp/claude-timetrack}"
 QUEUE="${HOME}/.claude/apropos-time/pending.tsv"
@@ -237,6 +250,21 @@ start_from_stamp() {
     fi
   fi
   date -u -d '1 minute ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -v-1M '+%Y-%m-%d %H:%M:%S' 2>/dev/null
+}
+
+# _start_local_hhmm -> sets START_HHMM to the turn's start (as start_from_stamp chooses it) as
+# HH:MM in this computer's local time, the time the person sees in Apropos. Builtins only where
+# bash has them (no command substitution, no tr), because every subprocess costs real time on
+# the shell this ships to; the date command is only the fallback for the older bash on a Mac.
+START_HHMM=""
+_start_local_hhmm() {
+  local ts="" e
+  START_HHMM=""
+  [[ -s "$startf" ]] && read -r ts < "$startf" 2>/dev/null
+  ts="${ts//[[:space:]]/}"
+  if [[ "$ts" =~ ^[0-9]+$ ]] && (( NOW - ts >= 0 && NOW - ts <= APROPOS_MAX_BACKDATE_SECS )); then e="$ts"; else e=$(( NOW - 60 )); fi
+  printf -v START_HHMM '%(%H:%M)T' "$e" 2>/dev/null
+  [[ "$START_HHMM" =~ ^[0-9]{2}:[0-9]{2}$ ]] || START_HHMM="$(date -d "@$e" +%H:%M 2>/dev/null || date -r "$e" +%H:%M 2>/dev/null)"
 }
 
 # Locate this session's transcript. Claude Code stores it at
@@ -1346,14 +1374,11 @@ record_turn() {
   # Before the repair that ends the hook, so this turn's description can fill them.
   (( WROTE )) && _sd_record "$START" "$TASK|$PROJ" "$DESC"
 
-  # ...and when nothing answers, say so. Until now this was the silent path: TASK stayed 0,
-  # the writer applied the person's fallback task, and the first anyone knew was reading
-  # the timesheet days later. Client work booked as internal overhead under-bills the
-  # customer and misreports where the day went, so it is worth interrupting for.
-  if [[ "$TASK" == "0" ]]; then
-    printf 'apropos: no task was stated this turn and no .apropos-task marker was found in %s or above it, so this entry goes to your catch-all task. Correct it today, or put a .apropos-task file holding the task number at the top of that folder so the work attributes itself from now on.
-' "${_optout_dir:-the working directory}" >&2
-  fi
+  # ...and when nothing answers, the turn goes to the catch-all and the person is told, once
+  # the entry exists (the day's list, below). Nothing else is consulted: the recorder never
+  # works out a task from what the turn did, so it can never book a task the session did not
+  # write. This used to be a line on the hook's error stream, which Claude Code
+  # discards for a hook that succeeds, so in practice nobody was told on the turn.
 
   # Worktype, best source first:
   #   1. the file the model wrote this turn
@@ -1593,35 +1618,42 @@ record_turn() {
     # Local, built from what the recorder saw. No credentials or database access ship
     # in this plugin and an audit is not a reason to change that. Every failure is
     # swallowed: recording the hour matters more than auditing it.
-    if [[ "$TASK" == "0" ]]; then
+    #
+    # Only an entry with neither a task nor a project goes to the catch-all: the insert script
+    # applies the person's catch-all task only then, so a project-only entry is not counted.
+    # The fourth column is the entry's start in this computer's local time, which is what the
+    # person sees in Apropos and what the lists show.
+    if [[ "$TASK" == "0" && "$PROJ" == "0" ]]; then
       {
+        _start_local_hhmm
         mkdir -p "${HOME}/.claude/apropos-time" 2>/dev/null &&
-        printf '%s	%s	%s
-' "$(date -u +%H:%M:%S)" "${_optout_dir:-unknown}" "$DESC" \
+        printf '%s\t%s\t%s\t%s\n' "$(date -u +%H:%M:%S)" "${_optout_dir:-unknown}" "$DESC" "$START_HHMM" \
           >> "${HOME}/.claude/apropos-time/catchall-$(date -u +%Y-%m-%d).tsv"
       } 2>/dev/null || true
     fi
   fi
 
 
-  # Re-surface the day's running total from HERE, not only at session start. Session start
-  # fires on a new session, a resume, a clear or a compact, none of which a single unbroken
-  # session is guaranteed to hit, so a day spent in one session would see the total once and
-  # never again. This hook runs on every turn regardless.
+  # Tell the person, visibly, which entries went to the catch-all today, by local start time and
+  # description. Visibly means the systemMessage: until now this was a line on the hook's
+  # error stream, which Claude Code discards for a hook that succeeds, so the per-turn reminder
+  # reached nobody.
   #
-  # Throttled to once an hour. A reminder on every turn is one people learn to scroll past,
-  # which is how it would quietly stop working.
-  if [[ "$TASK" == "0" ]]; then
+  # Said on a session's first catch-all entry, so each session's first one is seen when it
+  # happens, and then at most once an hour across the computer (APROPOS_CATCHALL_REPORT_SECS),
+  # because a reminder on every turn is one people learn to scroll past. Session start lists all
+  # of the day's entries as well, for a day spent in many short sessions.
+  if [[ "$TASK" == "0" && "$PROJ" == "0" ]]; then
     _ca_file="${HOME}/.claude/apropos-time/catchall-$(date -u +%Y-%m-%d).tsv"
     _ca_stamp="${HOME}/.claude/apropos-time/catchall-last-report"
+    _ca_told="$TRACK_DIR/catchall-told-$SID.txt"
     if [[ -s "$_ca_file" ]]; then
       _ca_last=0; [[ -s "$_ca_stamp" ]] && read -r _ca_last < "$_ca_stamp" 2>/dev/null
       [[ "$_ca_last" =~ ^[0-9]+$ ]] || _ca_last=0
-      if (( NOW - _ca_last >= ${APROPOS_CATCHALL_REPORT_SECS:-3600} )); then
-        _ca_n=0; while read -r _ca_l; do [[ -n "$_ca_l" ]] && _ca_n=$((_ca_n+1)); done < "$_ca_file"
-        printf 'apropos: %s entries so far today have gone to your catch-all task instead of a client. They are listed in %s. Correct them before the day closes.
-' "$_ca_n" "$_ca_file" >&2
+      if [[ ! -e "$_ca_told" ]] || (( NOW - _ca_last >= ${APROPOS_CATCHALL_REPORT_SECS:-3600} )); then
+        notice_add "$(catchall_list "$_ca_file" 6 '; ' 'Apropos: ')"
         printf '%s' "$NOW" > "$_ca_stamp" 2>/dev/null || true
+        : > "$_ca_told" 2>/dev/null || true
       fi
     fi
   fi
@@ -1676,6 +1708,19 @@ case "$EVENT" in
     # Stamp this turn's start for the Stop hook to use.
     printf '%s' "$NOW" > "$startf"
     [[ -n "$CWD" ]] && printf '%s' "$CWD" > "$cwdf"
+    # Tell the session, not the person, when nothing attributes its time. The instructions at
+    # session start say to write the task file, and sessions still went whole days without one:
+    # nothing told them, turn by turn, that their time was going to the catch-all.
+    # Only what the recorder itself reads decides this: the task file, the project file and the
+    # folder's markers, read as record_turn reads them (a file that holds no number sets
+    # nothing). The turn's commands are never read, so the note never names a task.
+    _cur=""; [[ -s "$taskf" ]] && IFS= read -r -d '' _cur < "$taskf" 2>/dev/null; _cur="${_cur//[[:space:]#]/}"
+    [[ "$_cur" =~ ^[0-9]+$ && "$_cur" != 0 ]] || _cur="$_dir_task"
+    _cpj=""; [[ -s "$projf" ]] && IFS= read -r -d '' _cpj < "$projf" 2>/dev/null; _cpj="${_cpj//[[:space:]]/}"
+    [[ "$_cpj" =~ ^[0-9]+$ && "$_cpj" != 0 ]] || _cpj="$_dir_proj"
+    if [[ -z "$_cur" && -z "$_cpj" ]]; then
+      APROPOS_CONTEXT="Time recording: no task is set for this session, so its time is going to the person's catch-all task. If this turn's work belongs to a task (one the person named for this work, one you were asked or dispatched to work on, or one you read or change, branch or commit for in doing the work), write its number to $taskf before the turn ends. A task you only read for reference, mention in passing, or file as a follow-up is not this session's task. Do not mention this note."
+    fi
     ;;
 esac
 
