@@ -378,13 +378,126 @@ write_entry() {
   out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$entry" "${args[@]}" 2>/dev/null)"
   rc=$?
   (( rc != 0 )) && return $rc
+  # With the send-back on, every row's id is kept by its person and start, a task or not, so the
+  # Stop after a held reply's extra step can change the very row its first Stop wrote (ei_record).
+  # One appended line: this runs inside a delivery, before the queue drops the line delivered, so it
+  # must cost next to nothing. With the setting off nothing here differs from before.
+  local newId="" keep=0
+  case "${APROPOS_SENDBACK:-}" in [Oo][Nn]|1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) keep=1 ;; esac
+  if (( keep )) || [[ -n "$task" && "$task" != "0" ]]; then
+    newId="$(printf '%s' "$out" | grep -o 'APROPOS_ENTRY_ID=[0-9]*' | head -1 | cut -d= -f2)"
+  fi
+  (( keep )) && [[ -n "$newId" ]] && ei_record "$person" "$start" "$newId"
   # Remember the row just written, so the next turn on this activity amends it. Only
   # entries with a task qualify: the amend path cannot touch a row with no task without
   # clearing its attribution.
   if [[ -n "$task" && "$task" != "0" ]]; then
-    local newId
-    newId="$(printf '%s' "$out" | grep -o 'APROPOS_ENTRY_ID=[0-9]*' | head -1 | cut -d= -f2)"
     [[ -n "$newId" ]] && oe_record "$wt|$task|$proj" "$newId" "$(printf '%s' "$desc" | base64 | tr -d '\n')"
   fi
   return 0
+}
+
+# THE ROWS JUST WRITTEN, by person and start. The open-entry record above keeps only
+# rows with a task, and only while they are open, so a held reply booked to the catch-all had no
+# id anywhere. Lines are: person <TAB> start <TAB> entryId <TAB> epoch written. A line is only
+# ever added here; lines older than a day are dropped by ei_prune, which the send-back runs when
+# it holds a reply, outside any delivery.
+APROPOS_ENTRY_IDS_FILE="${APROPOS_ENTRY_IDS_FILE:-${HOME}/.claude/apropos-time/entry-ids.tsv}"
+ei_record() {
+  local now=""
+  [[ "$3" =~ ^[0-9]+$ && -n "$1" && -n "$2" ]] || return 0
+  printf -v now '%(%s)T' -1 2>/dev/null
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${now:-0}" >> "$APROPOS_ENTRY_IDS_FILE" 2>/dev/null || true
+  return 0
+}
+# ei_prune - drop lines older than a day, under the lock the queue uses. Without the lock, nothing.
+ei_prune() {
+  local now tmp p s i e
+  [[ -s "$APROPOS_ENTRY_IDS_FILE" ]] || return 0
+  command -v q_lock >/dev/null 2>&1 && q_lock "$APROPOS_ENTRY_IDS_FILE" || return 0
+  printf -v now '%(%s)T' -1 2>/dev/null; [[ "$now" =~ ^[0-9]+$ ]] || now="$(date -u +%s)"
+  tmp="$APROPOS_ENTRY_IDS_FILE.tmp.$$"
+  {
+    while IFS=$'\t' read -r p s i e; do
+      [[ "$e" =~ ^[0-9]+$ && "$i" =~ ^[0-9]+$ ]] || continue
+      (( now - e > 86400 )) && continue
+      printf '%s\t%s\t%s\t%s\n' "$p" "$s" "$i" "$e"
+    done < "$APROPOS_ENTRY_IDS_FILE"
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$APROPOS_ENTRY_IDS_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null || true
+  q_unlock "$APROPOS_ENTRY_IDS_FILE"
+  return 0
+}
+# ei_lookup <person> <start> -> prints the id of the row written for that person at that start; 1
+# when there is none, and also when two different rows were written at that start (two sessions in
+# the same second): the id cannot then say which is which, so the caller goes by start, and the
+# scripts refuse a start that matches more than one row.
+ei_lookup() {
+  local p s i e found=""
+  [[ -s "$APROPOS_ENTRY_IDS_FILE" ]] || return 1
+  while IFS=$'\t' read -r p s i e; do
+    [[ "$p" == "$1" && "$s" == "$2" && "$i" =~ ^[0-9]+$ ]] || continue
+    [[ -n "$found" && "$found" != "$i" ]] && return 1
+    found="$i"
+  done < "$APROPOS_ENTRY_IDS_FILE"
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
+
+# oe_forget <activityKey> <entryId> - the entry is no longer open for that activity (it has been
+# moved to other work): drop the line for that activity that points at it, and only that line.
+oe_forget() {
+  local key="$1" id="$2" tmp k i e b wrote=0
+  [[ "$id" =~ ^[0-9]+$ && -s "$APROPOS_OPEN_FILE" ]] || return 0
+  _oe_lock || return 0
+  tmp="$APROPOS_OPEN_FILE.tmp.$$"
+  {
+    while IFS=$'\t' read -r k i e b; do
+      [[ "$k" == "$key" && "$i" == "$id" ]] && continue
+      printf '%s\t%s\t%s\t%s\n' "$k" "$i" "$e" "$b"
+    done < "$APROPOS_OPEN_FILE"
+  } > "$tmp" 2>/dev/null && wrote=1
+  (( wrote )) && mv "$tmp" "$APROPOS_OPEN_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null || true
+  _oe_unlock
+  return 0
+}
+
+# MOVING A ROW TO ANOTHER TASK. Set-TimeEntryTask.ps1 on R: re-attributes a row. As it
+# stood when this was written it selected the row by id only, had no guard against overwriting a
+# correction, and left the billable flag as it was, so a reply booked to the catch-all (whose
+# project never bills) and then given a client task would have stayed unbilled. The send-back only
+# moves a row through a version that can do all three: select by start time, refuse when the row
+# no longer holds the expected description, and take the new task's billable flag. That version
+# is recognised by its parameters, read from the script itself, so nothing is called that would
+# move a row the wrong way; with any other version the row stays where it was booked.
+#
+# move_supported - true when the installed script declares -InheritBillable, -ExpectDescription
+# and -StartTimeUTC, outside comments.
+move_supported() {
+  local s="${APROPOS_SKILL_DIR:-R:/Intranet/ClaudeAI/skills/work-management/time}/Set-TimeEntryTask.ps1"
+  [[ -f "$s" ]] || return 1
+  grep -Eqi '^[^#]*\[switch\][[:space:]]*\$InheritBillable([^A-Za-z0-9_]|$)' "$s" 2>/dev/null || return 1
+  grep -Eqi '^[^#]*\$ExpectDescription([^A-Za-z0-9_]|$)' "$s" 2>/dev/null || return 1
+  grep -Eqi '^[^#]*\$StartTimeUTC([^A-Za-z0-9_]|$)' "$s" 2>/dev/null || return 1
+  return 0
+}
+
+# move_entry <id or ""> <start> <person> <task> <worktype> <desc> <expect> - move the row to the
+# task and worktype and give it the description, in one write the script refuses (exit 2) when
+# the row no longer holds <expect>. By id when it is known, otherwise by person and start. Sets
+# MOVE_ID to the id the script reports. Returns the script's exit code.
+MOVE_ID=""
+move_entry() {
+  local id="$1" start="$2" person="$3" task="$4" wt="$5" desc="$6" expect="$7" out rc
+  MOVE_ID=""
+  local script="${APROPOS_SKILL_DIR:-R:/Intranet/ClaudeAI/skills/work-management/time}/Set-TimeEntryTask.ps1"
+  [[ -f "$script" ]] || return 1
+  local ps; ps="$(apropos_ps_exe)" || return 1
+  local -a sel=(-StartTimeUTC "$start")
+  [[ "$id" =~ ^[0-9]+$ ]] && sel=(-TimeEntryID "$id")
+  out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" "${sel[@]}" -PersonID "$person" \
+    -TaskDisplayID "$task" -WorkTypeID "$wt" -Description "$desc" -ExpectDescription "$expect" -InheritBillable 2>/dev/null)"; rc=$?
+  MOVE_ID="$(printf '%s' "$out" | grep -o 'APROPOS_ENTRY_ID=[0-9]*' | head -1 | cut -d= -f2)"
+  return "$rc"
 }

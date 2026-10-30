@@ -41,6 +41,9 @@ notice_add() { APROPOS_NOTICE="${APROPOS_NOTICE:+$APROPOS_NOTICE }$1"; }
 # What the SESSION is told, on a prompt only: hookSpecificOutput.additionalContext, which Claude
 # Code adds to the session's context beside the prompt and does not show the person.
 APROPOS_CONTEXT=""
+# The send-back's request (THE SEND-BACK, below), on a Stop only: a block decision with this reason
+# makes Claude Code take one more step in the session before the reply ends.
+SB_REASON=""
 _json_str() {
   local s="$1" bs dq
   bs="$(printf '\134')"; dq='"'     # a backslash and a double quote, the two JSON escapes
@@ -52,9 +55,10 @@ _json_str() {
   printf '%s' "$s"
 }
 notice_emit() {
-  [[ -n "$APROPOS_NOTICE" || -n "$APROPOS_CONTEXT" ]] || return 0
+  [[ -n "$APROPOS_NOTICE" || -n "$APROPOS_CONTEXT" || -n "$SB_REASON" ]] || return 0
   local out=""
-  [[ -n "$APROPOS_NOTICE" ]] && out="\"systemMessage\":\"$(_json_str "$APROPOS_NOTICE")\""
+  [[ -n "$SB_REASON" && "$EVENT" == "Stop" ]] && out="\"decision\":\"block\",\"reason\":\"$(_json_str "$SB_REASON")\""
+  [[ -n "$APROPOS_NOTICE" ]] && out="${out:+$out,}\"systemMessage\":\"$(_json_str "$APROPOS_NOTICE")\""
   if [[ -n "$APROPOS_CONTEXT" && "$EVENT" == "UserPromptSubmit" ]]; then
     out="${out:+$out,}\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"$(_json_str "$APROPOS_CONTEXT")\"}"
   fi
@@ -86,6 +90,10 @@ SID="${SID:-${CLAUDE_CODE_SESSION_ID:-nosession}}"
 # Older payloads / direct invocation carry no event name. Treat as UserPromptSubmit
 # so an un-migrated hooks.json keeps the previous single-event behaviour.
 EVENT="${EVENT:-UserPromptSubmit}"
+# A helper agent's stop is not this hook's business. It is not registered, and if it ever
+# arrives it carries the parent's own session id, so treated as anything else it would stamp or
+# record the parent's turn.
+[[ "$EVENT" == "SubagentStop" ]] && exit 0
 
 # Opt out of time recording entirely. Scheduled and headless runs are nobody's
 # working time: a `claude -p` job fired by Task Scheduler has no human at the keyboard
@@ -104,6 +112,311 @@ esac
 case "$(printf '%s' "${APROPOS_SKIP:-}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on) exit 0 ;;
 esac
+
+# AN IDLE CHECK-IN IS NOT WORK.
+#
+# A session that belongs to a working group in the MMRY memory service is woken about every half
+# hour by a background notification that renews its watch, and it answers only "Still listening.".
+# Each of those turns used to be recorded like any other: it was absorbed into the entry open for
+# the session's last activity, or, with none open, opened an entry of its own under the session's
+# last task and worktype, flagged for its description. Overnight that was an entry about every
+# half hour in every grouped session, some on client projects, on time nobody worked, each to be
+# found and corrected by hand.
+#
+# So a Stop records nothing, and changes nothing, only when BOTH of these hold, and nothing looser:
+#   (a) the prompt that started the turn is the watcher's own notification: the turn's prompt in
+#       the transcript is one background-task notification carrying the watcher's fixed wording,
+#       both "MMRY FORMATION WATCH RENEWED" and "There is nothing to act on and nothing to
+#       report", and no message ("DIRECTED TO YOU"); and it is the prompt the Stop input names;
+#   (b) the reply, trimmed, is exactly "Still listening." as the Stop input carries it, and the
+#       transcript agrees (REPLY NOT YET WRITTEN, below), and nothing else happened in the turn: no tool call but
+#       the memory service's own housekeeping (below), no message queued into it, and no later
+#       message after the notification, such as one from another session, which Claude Code
+#       writes as a record of its own that the turn's prompt test above does not count. Such a
+#       message starts a turn of its own: its Stop names its own prompt and is recorded from its
+#       own prompt stamp.
+# Housekeeping is a closed set, measured on every local transcript before it was written. Many
+# sessions check, before answering, that the memory service's directive file is unchanged, and
+# some ask it for their group's members. Those turns do no work either. A tool call counts as
+# housekeeping only when it is one of these, and every tool call in the turn must be:
+#   - Read of a file whose name starts "mmry-foundation.byref" (the directive file);
+#   - Bash that only reads that file: assignments of its path to a lower-case name, and wc, cat,
+#     head, tail, grep and echo, with only the options listed in hk_cmd, every file they name being
+#     that file, joined by ; && || | or new lines; and md5sum with no option of that file alone,
+#     its output read by nothing or piped only into cut with one -c or -b range;
+#   - Bash that runs the memory service's foundation-status.sh or formation-roster.sh, with no
+#     argument, from its hooks-handlers folder under .claude in this user's home, alone or with the
+#     reads above. The home is named as an unquoted ~ starting the word, as "$HOME", or written out
+#     exactly as this hook's own HOME (in either Windows form). A quoted or escaped ~ is not the
+#     home (the shell does not expand it, so it names a folder under the working directory), and
+#     neither is any other user's folder or a path through ., .. or ~.
+# A Bash command longer than 2048 characters is not housekeeping and is not read at all: real ones
+# are under 300, and reading a very long one would outlast the Stop hook's time.
+# The command is read as a narrow subset of the shell, and anything outside it is not housekeeping:
+# any other command or option, another file, writing to a file (only "< file", "2>&1" and
+# "2>/dev/null" are read), command substitution, globbing, braces, subshells, comments, running in
+# the background, a variable not assigned in the same command (but "$HOME" in the status script's
+# path). Sending a message to the group
+# (formation-say.sh) is never housekeeping. And every tool result in the turn must answer one of
+# those calls.
+# Everything else takes the ordinary path below, exactly as before: a transmission that carries
+# a message, any other reply, a check-in turn that calls any other tool, and anything this cannot
+# read (no jq, no transcript, no reply in the Stop input, or the turn's prompt further back than
+# the part of the transcript read). Measured on real sessions, a check-in turn was at most about half a
+# megabyte of transcript, so the last APROPOS_CHECKIN_TAIL_BYTES (default 4 MiB) are read, and
+# only once the reply in the Stop input has been found to be the check-in's: no other turn reads
+# the transcript or starts a process for this.
+#
+# REPLY NOT YET WRITTEN. In an interactive session the Stop runs before Claude Code writes the
+# turn's last message: the transcript then holds the prompt and every tool call and result, but not
+# the reply, which it writes once the Stop hooks have finished. Measured 2026-10-28 in interactive
+# sessions woken by a stand-in for the watcher, and in the real sessions' record: a rule that
+# waited for the reply in the transcript recorded nearly every check-in (it skipped 8 of some 360
+# after the first release candidate went in, and recorded the rest, many overnight). So the reply
+# is read from the Stop input, and the transcript must agree with it in one of two ways:
+#   - the last message written that carries text or a tool call carries text and no tool call:
+#     the reply is written, and every word written in the turn, trimmed, is "Still listening.";
+#   - otherwise (nothing written yet, thinking only, or tool calls and results only) the reply is
+#     not written yet: no message written in the turn carries a word, and the Stop input names this
+#     turn's prompt (a Stop that names none, or another, is not read this way).
+# The last message is only ever text: a turn whose last message calls a tool has not ended.
+#
+# Skipped means: no entry opened or amended, no send-back, no delivery or repair, no notice, and no
+# file touched but the turn's own prompt stamp, which is removed as every Stop removes it. So the
+# next turn finds the description, task, worktype and open entries exactly as the turn before
+# the check-in left them. The prompt's own hook is unchanged: at that point the reply is unknown.
+_ci_idle_checkin() {
+  [[ "$EVENT" == Stop ]] || return 1
+  # Free, and enough to rule out nearly every turn.
+  [[ "$INPUT" == *'Still listening.'* ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local ok="" pid="" tp="" slug size bytes cut=false verdict=""
+  {
+    IFS= read -r ok; IFS= read -r pid; IFS= read -r tp
+  } < <(printf '%s' "$INPUT" | jq -r '
+      ((.last_assistant_message | type) == "string"
+        and ((.last_assistant_message | sub("\\A[[:space:]]+"; "") | sub("[[:space:]]+\\z"; "")) == "Still listening.")),
+      (.prompt_id // "" | tostring),
+      (.transcript_path // "" | tostring)' 2>/dev/null)
+  # jq on Windows ends its lines with a carriage return.
+  ok="${ok%$'\r'}"; pid="${pid%$'\r'}"; tp="${tp%$'\r'}"
+  [[ "$ok" == true ]] || return 1
+  [[ -n "${APROPOS_TRANSCRIPT:-}" ]] && tp="$APROPOS_TRANSCRIPT"
+  if [[ -z "$tp" ]]; then
+    # Where Claude Code keeps it (transcript_path, below, explains the folder name).
+    [[ -n "$CWD" && -n "$SID" ]] || return 1
+    slug="${CWD//[^A-Za-z0-9]/-}"; tp="${HOME}/.claude/projects/${slug}/${SID}.jsonl"
+  fi
+  # A Windows path reads the same with forward slashes, in every shell this runs in.
+  tp="${tp//\\//}"
+  [[ -s "$tp" ]] || return 1
+  bytes="${APROPOS_CHECKIN_TAIL_BYTES:-4194304}"
+  [[ "$bytes" =~ ^[0-9]{1,10}$ ]] && (( 10#$bytes > 0 )) || bytes=4194304
+  bytes=$(( 10#$bytes ))
+  size="$(wc -c < "$tp" 2>/dev/null)"; size="${size//[[:space:]]/}"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  # Read from part way through a line, the first line is not a whole record: it is dropped.
+  (( size > bytes )) && cut=true
+  # The housekeeping test (see above). hk_bash reads one Bash command: hk_items cuts it into words,
+  # operators and redirections, and gives up when the pieces do not make up the whole command.
+  local hk
+  hk='
+    def hk_fpath: ((split("/") | last // "") | (split("\\") | last // "") | startswith("mmry-foundation.byref"));
+    def hk_pieces:
+      if startswith("\u0027") then [{l: .[1:-1]}]
+      elif startswith("\"") then
+        [.[1:-1] | match("[$][{][A-Za-z_][A-Za-z0-9_]*[}]|[$][A-Za-z_][A-Za-z0-9_]*|[\\\\](?:.|\n)|[^\\\\$]+"; "g") | .string
+         | if startswith("$") then {v: gsub("[${}]"; ""), q: true}
+           elif startswith("\\") then (if (.[1:] | IN("$", "`", "\"", "\\")) then {l: .[1:]} elif .[1:] == "\n" then {l: ""} else {l: .} end)
+           else {l: .} end]
+        # An empty quoted string is still a quoted piece: a ~ after it does not start the word.
+        | if length == 0 then [{l: ""}] else . end
+      elif startswith("\\") then (if .[1:] == "\n" then [{l: ""}] else [{l: .[1:]}] end)
+      elif startswith("$") then [{v: gsub("[${}]"; ""), q: false}]
+      else [{l: ., u: true}] end;
+    def hk_items:
+      . as $c
+      | [match("[ \t]+|&&|[|][|]|[|]&|[;&|\n]|[0-9]*(?:>>|>&|>[|]|>|<<<|<<|<&|<>|<)|\u0027[^\u0027]*\u0027|\"(?:[^\"\\\\$`]|[\\\\](?:.|\n)|[$][{][A-Za-z_][A-Za-z0-9_]*[}]|[$][A-Za-z_][A-Za-z0-9_]*)*\"|[\\\\](?:.|\n)|[$][{][A-Za-z_][A-Za-z0-9_]*[}]|[$][A-Za-z_][A-Za-z0-9_]*|[^[:space:]\u0027\"\\\\$`;&|<>()#*?{}!\\[\\]]+"; "g") | .string] as $t
+      | if ($t | join("")) != $c then null else
+          (reduce $t[] as $k ({it: [], w: null, bad: false};
+             if ($k | test("\\A[ \t]+\\z")) then (if .w then .it += [{w: .w}] | .w = null else . end)
+             elif ($k | IN("&&", "||", "|&", ";", "&", "|", "\n")) then (if .w then .it += [{w: .w}] | .w = null else . end) | .it += [{o: $k}]
+             elif ($k | test("\\A[0-9]*(?:>>|>&|>[|]|>|<<<|<<|<&|<>|<)\\z")) then
+               (if .w and ($k | test("\\A[0-9]")) then .bad = true else . end)
+               | (if .w then .it += [{w: .w}] | .w = null else . end) | .it += [{r: $k}]
+             else .w = ((.w // []) + ($k | hk_pieces)) end)
+           | if .w then .it += [{w: .w}] else . end
+           | if .bad then null else .it end)
+        end;
+    def hk_lit: if all(.[]; has("l")) then (map(.l) | join("")) else null end;
+    def hk_fref($vars):
+      if length == 1 and (.[0] | has("v")) then (.[0] as $p | ($vars | has($p.v)) and ($p.q or $vars[$p.v]))
+      else (hk_lit) as $l | $l != null and ($l | hk_fpath) and ($l | contains("\\") | not) end;
+    def hk_num: . != null and test("\\A[+-]?[0-9]+[A-Za-z]{0,2}\\z");
+    def hk_tail: test("\\A/[.]claude/mmry/hooks-handlers/(?:foundation-status|formation-roster)[.]sh\\z");
+    def hk_homes:
+      ($ENV.HOME // "" | tostring | gsub("\\\\"; "/") | sub("/+\\z"; "")) as $h
+      | (if ($h | test("\\A[A-Za-z]:/")) then {d: $h[0:1], r: $h[2:]} elif ($h | startswith("/")) then {d: null, r: $h} else null end) as $x
+      | if $x == null or ($x.r | split("/") | .[1:] | any(.[]; . == "" or . == "." or . == ".." or . == "~")) then []
+        elif $x.d == null then [$x.r]
+        else [($x.d | ascii_downcase, ascii_upcase) as $d | ("/" + $d + $x.r), ($d + ":" + $x.r)] end;
+    def hk_script:
+      if length >= 1 and (.[0] | has("v")) and .[0].v == "HOME" and .[0].q then
+        (.[1:] | hk_lit) as $r | $r != null and ($r | hk_tail)
+      elif length >= 1 and (.[0].u // false) and (.[0].l | startswith("~/")) then
+        (hk_lit) as $l | $l != null and ($l[1:] | hk_tail)
+      else
+        (hk_lit) as $l
+        | $l != null
+          and ((($l | capture("\\A(?<h>(?:.|\n)*)(?<t>/[.]claude/mmry/hooks-handlers/[^/]*)\\z")) // null) as $m
+               | $m != null and ($m.t | hk_tail) and ($m.h as $h | hk_homes | any(.[]; . == $h)))
+      end;
+    def hk_cmd($vars; $first):
+      . as $c
+      | (reduce range(0; $c | length) as $i ({ws: [], rd: [], skip: false, bad: false};
+           if .skip then .skip = false
+           elif ($c[$i] | has("r")) then
+             (if ($i + 1) < ($c | length) and ($c[$i + 1] | has("w")) then .rd += [[$c[$i].r, $c[$i + 1].w]] | .skip = true else .bad = true end)
+           else .ws += [$c[$i].w] end)) as $s
+      | ($s.rd | map(if (.[0] | IN("<", "0<")) and (.[1] | hk_fref($vars)) then "f"
+                     elif .[0] == "2>&" and (.[1] | hk_lit) == "1" then "n"
+                     elif .[0] == "2>" and (.[1] | hk_lit) == "/dev/null" then "n"
+                     else "x" end)) as $rk
+      | ($s.ws[0] // [] | hk_lit) as $name
+      | if $s.bad or ($s.ws | length) == 0 or any($rk[]; . == "x") then {ok: false}
+        elif $first and (($name == "bash" and ($s.ws | length) == 2 and ($s.ws[1] | hk_script)) or (($s.ws | length) == 1 and ($s.ws[0] | hk_script)))
+          and all($rk[]; . == "n") then {ok: true, read: true}
+        elif $name == "echo" then
+          {ok: (all($rk[]; . == "n") and all($s.ws[1:][]; hk_lit != null or (length == 1 and (.[0] | has("v")) and (.[0].v as $n | $vars | has($n))))), read: false}
+        elif $name == "md5sum" then
+          {ok: ($first and all($rk[]; . == "n") and ($s.ws | length) == 2
+                and (($s.ws[1] | hk_lit) as $l | $l == null or ($l | startswith("-") | not)) and ($s.ws[1] | hk_fref($vars))),
+           read: true, n: $name}
+        elif $name == "cut" then
+          ([$s.ws[1:][] | hk_lit]) as $a
+          | "(?:[0-9]+|[0-9]+-[0-9]*|-[0-9]+)(?:,(?:[0-9]+|[0-9]+-[0-9]*|-[0-9]+))*\\z" as $list
+          | {ok: (($first | not) and all($rk[]; . == "n")
+                  and ((($a | length) == 1 and $a[0] != null and ($a[0] | test("\\A-[bc]" + $list)))
+                       or (($a | length) == 2 and ($a[0] | IN("-b", "-c")) and $a[1] != null and ($a[1] | test("\\A" + $list))))),
+             read: false, n: $name}
+        elif ($name | IN("wc", "cat", "head", "tail", "grep")) then
+          (reduce $s.ws[1:][] as $w ({need: null, pat: false, files: 0, bad: false, end: false};
+             ($w | hk_lit) as $l
+             | if .bad then .
+               elif .need == "num" then (if ($l | hk_num) then .need = null else .bad = true end)
+               elif .need == "pat" then (if $l != null then .need = null | .pat = true else .bad = true end)
+               elif (.end | not) and $l == "--" then .end = true
+               elif (.end | not) and $l != null and ($l | test("\\A-.")) then
+                 (if $name == "wc" then (if ($l | test("\\A-[clmwL]+\\z")) then . else .bad = true end)
+                  elif $name == "cat" then (if ($l | test("\\A-[AbeEnstTuv]+\\z")) then . else .bad = true end)
+                  elif $name == "head" or $name == "tail" then
+                    (if ($l | test("\\A-(?:[0-9]+|[qv]|[nc][+-]?[0-9]+[A-Za-z]{0,2})\\z")) then .
+                     elif ($l | IN("-n", "-c")) then .need = "num" else .bad = true end)
+                  else
+                    (if ($l | test("\\A-[cnivxwoqshHlLEFGPzabT]+\\z")) then .
+                     elif ($l | test("\\A-[cnivxwoqshHlLEFGPzabT]*[mABC][0-9]+\\z")) then .
+                     elif ($l | test("\\A-[cnivxwoqshHlLEFGPzabT]*[mABC]\\z")) then .need = "num"
+                     elif $l == "-e" then .need = "pat"
+                     elif ($l | startswith("-e")) then .pat = true
+                     else .bad = true end) end)
+               elif $name == "grep" and (.pat | not) then (if $l != null then .pat = true else .bad = true end)
+               elif ($w | hk_fref($vars)) then .files += 1
+               else .bad = true end)) as $a
+          | ($a.files + ([$rk[] | select(. == "f")] | length)) as $n
+          | {ok: (($a.bad | not) and $a.need == null and ($name != "grep" or $a.pat) and (($first | not) or $n > 0)), read: ($n > 0)}
+        else {ok: false} end;
+    def hk_bash:
+      if length > 2048 then false else
+      (hk_items) as $it
+      | if $it == null then false else
+          (reduce $it[] as $x ({s: [[[]]], bad: false, o: ""};
+             (.s | length - 1) as $a | (.s[$a] | length - 1) as $b
+             | if ($x | has("o")) then
+                 (if ($x.o | IN("&", "|&")) then .bad = true
+                  elif $x.o != "\n" and (.s[$a][$b] | length) == 0 then .bad = true
+                  elif $x.o == "|" then .s[$a] += [[]]
+                  else .s += [[[]]] end) | .o = $x.o
+               else .s[$a][$b] += [$x] | .o = "" end)) as $p
+          | if $p.bad or ($p.o | IN("&&", "||", "|")) then false else
+              (reduce $p.s[] as $st ({vars: {}, read: false, ok: true};
+                 if (.ok | not) then .
+                 elif ($st | length) == 1 and ($st[0] | length) == 0 then .
+                 elif any($st[]; length == 0) then .ok = false
+                 elif ($st | length) == 1 and ($st[0] | length) == 1 and ($st[0][0] | has("w"))
+                      and ($st[0][0].w[0] | (.u // false) and (.l | test("\\A[a-z][a-z0-9_]*="))) then
+                   ($st[0][0].w[0].l | capture("\\A(?<n>[a-z][a-z0-9_]*)=(?<r>(?:.|\n)*)\\z")) as $m
+                   | ([{l: $m.r}] + $st[0][0].w[1:] | hk_lit) as $val
+                   | if $val != null and ($val | hk_fpath) and ($val | startswith("-") | not) and ($val | test("[\\\\\n]") | not)
+                     then .vars[$m.n] = ($val | test("[[:space:]*?{}]|[\\[\\]]") | not) else .ok = false end
+                 else
+                   .vars as $v
+                   | [range(0; $st | length) as $j | $st[$j] | hk_cmd($v; $j == 0)] as $r
+                   | [$r[] | .n // ""] as $ns
+                   | if all($r[]; .ok) and ((any($ns[]; . == "md5sum" or . == "cut") | not) or $ns == ["md5sum"] or $ns == ["md5sum", "cut"])
+                     then .read = (.read or any($r[]; .read)) else .ok = false end
+                 end)) | .ok and .read
+            end
+        end
+      end;
+    def hk_call:
+      type == "object" and .type == "tool_use" and (.input | type) == "object"
+      and ((.name == "Read" and (.input.file_path | type) == "string" and (.input.file_path | hk_fpath))
+           or (.name == "Bash" and .input.run_in_background != true and (.input.command | type) == "string" and (.input.command | hk_bash)));
+  '
+  verdict="$(tail -c "$bytes" "$tp" 2>/dev/null | jq -R -s -r --arg pid "$pid" --argjson cut "$cut" "$hk"'
+    def trimmed: sub("\\A[[:space:]]+"; "") | sub("[[:space:]]+\\z"; "");
+    def texts: if type == "string" then .
+               elif type == "array" then [.[] | select(type == "object" and .type == "text") | (.text // "" | tostring)] | join("")
+               else "" end;
+    def prompt: type == "object" and .type == "user" and (.isMeta != true)
+                and ((.message.content | type) == "string"
+                     or ((.message.content | type) == "array" and any(.message.content[]; type == "object" and .type == "text")));
+    (split("\n") | (if $cut then .[1:] else . end) | map(fromjson? // empty) | map(select(type == "object"))) as $r
+    | ([$r | to_entries[] | select(.value | prompt) | .key] | last) as $i
+    | if $i == null then "keep" else
+        $r[$i] as $p | $r[$i + 1:] as $rest | ($p.message.content | texts) as $t
+        | if (($p.origin.kind? // "") == "task-notification")
+             and ($t | test("\\A[[:space:]]*<task-notification>"))
+             and ([$t | match("<task-notification>"; "g")] | length) == 1
+             and ($t | contains("MMRY FORMATION WATCH RENEWED"))
+             and ($t | contains("There is nothing to act on and nothing to report"))
+             and ($t | contains("DIRECTED TO YOU") | not)
+             and ($pid == "" or ($p.promptId // "" | tostring) == "" or ($p.promptId | tostring) == $pid)
+             and ([$rest[] | select(.type == "assistant") | .message.content
+                   | if type == "array" then .[] else empty end
+                   | select(type == "object" and ((.type // "" | tostring) | test("tool_use$")))] as $tu
+                  | all($tu[]; hk_call)
+                    and all($rest[] | select(.type == "user" and (.message.content | type) == "array")
+                            | .message.content[] | select(type == "object" and .type == "tool_result");
+                            (.tool_use_id // "" | tostring) as $id | $id != "" and any($tu[]; (.id // "" | tostring) == $id)))
+             and ([$rest[] | select(.type == "attachment" and (.attachment.type? // "") == "queued_command")] | length) == 0
+             and ([$rest[] | select(.type == "user" and ((.message.content | type) == "string"
+                      or ((.message.content | type) == "array" and any(.message.content[]; type == "object" and .type == "text"))))] | length) == 0
+             # The reply (REPLY NOT YET WRITTEN, above): the last message written that carries text or a
+             # tool call is the reply when it carries text and no tool call, and then every word
+             # written in the turn is exactly the answer to the watcher. Otherwise the reply is not
+             # written yet: nothing written in the turn may carry a word, and the Stop must name this
+             # prompt, so the reply its input carries belongs to this turn.
+             and ((([$rest[] | select(.type == "assistant") | .message.content | texts] | join("")) | trimmed) as $said
+                 | ([$rest[] | select(.type == "assistant") | .message.content
+                     | if type == "string" then {x: true, u: false}
+                       elif type == "array" then
+                         {x: any(.[]; type == "object" and .type == "text"),
+                          u: any(.[]; type == "object" and ((.type // "" | tostring) | test("tool_use$")))}
+                       else {x: false, u: false} end
+                     | select(.x or .u)] | last) as $l
+                 | if $l != null and $l.x and ($l.u | not) then $said == "Still listening."
+                   else $said == "" and $pid != "" and ($p.promptId // "" | tostring) == $pid end)
+          then "skip" else "keep" end
+      end' 2>/dev/null)"
+  verdict="${verdict%$'\r'}"
+  [[ "$verdict" == skip ]]
+}
+if _ci_idle_checkin; then
+  rm -f "$TRACK_DIR/turnstart-$SID.txt" 2>/dev/null
+  exit 0
+fi
+
 # Stamp the working directory before the marker check, not after. The Stop payload
 # carries no cwd, so without this an opted-out session would exit at UserPromptSubmit
 # having recorded nothing, and then Stop would have no cwd to test the marker against
@@ -155,6 +468,172 @@ if [[ -n "$_optout_dir" ]]; then
   done
 fi
 
+descf="$TRACK_DIR/description-$SID.txt"
+wtf="$TRACK_DIR/worktype-$SID.txt"
+taskf="$TRACK_DIR/task-$SID.txt"
+projf="$TRACK_DIR/project-$SID.txt"
+# The worktype the model wrote is a one-shot file, deleted at the end of the turn.
+# These two are what make it survive: the session carries its last worktype, and the
+# machine remembers the worktype last used on each task so a NEW session on known
+# work does not fall back to Engineering.
+stickywtf="$TRACK_DIR/worktype-sticky-$SID.txt"
+taskwtf="$TRACK_DIR/task-worktype.tsv"
+lastf="$TRACK_DIR/last-entry-$SID.txt"
+startf="$TRACK_DIR/turnstart-$SID.txt"
+cwdf="$TRACK_DIR/cwd-$SID.txt"
+
+# THE SEND-BACK: a reply that ends without its time notes is sent back once to write them.
+#
+# Every entry depends on the session writing two notes before a reply ends: the description
+# file and the task file. Sessions told both at start and on every prompt still wrote neither;
+# in one day's test of the previous release two task lookups went to the catch-all as blank
+# flags, and twelve of thirteen catch-all entries that day were blank or flagged. Instructions
+# alone did not change that, so for a person it is switched on for, the Stop that ends a reply
+# returns a block decision with a one-line reason, and Claude Code takes one more step in the
+# session before the reply ends. The session writes its notes in that step.
+#
+# What sends a reply back, and nothing else:
+#   - this turn's description file was not written after the prompt arrived (empty, missing,
+#     or older than the prompt's stamp), or
+#   - once per session, no task file, project file or folder marker applies and the task file
+#     does not hold "none", which a session writes for work with no task.
+# Only the first Stop of a reply can be held: one whose stop_hook_active is absent or the JSON
+# value false. Any other value (true, 1, "true", "True", "false", "", null, an object) or input
+# that cannot be read is not held, because holding the Stop after an extra step is the one thing
+# that must never happen, and an unclear marker is safer read as that. Never held either: a run
+# nobody is watching, an input from a helper agent, a person not yet identified (there is no
+# entry of theirs the notes could change yet), a turn whose own new entry has a project and no
+# task (the description script on R: refuses to amend a row with no task, so nothing the session
+# wrote could reach it), an opted-out folder or run (both exit above), or with APROPOS_SENDBACK
+# not on.
+#
+# RECORD FIRST, THEN SEND BACK (approved 2026-10-20, after two QA rounds found rare orderings in
+# which recording a held reply later lost it or recorded it twice). The Stop records the turn
+# first, exactly as it always has: the same insert or the same amend of the open entry, at the
+# same start, on the same task, flagged when there is no description. Only then is the hold
+# returned. So a session closed, interrupted or cut off during the extra step leaves exactly the
+# entry it would have had with no send-back at all, flagged, and nothing is left to record later.
+#
+# The Stop after the extra step changes that same entry and never adds one for the turn. The rule
+# it is held to: what is in Apropos afterwards is what would be there had the session written the
+# same notes before its first Stop. From what the first Stop did (_sb_apply, below):
+#   - absorbed the turn into the entry already open for the work, writing nothing: the note
+#     replaces that entry's description, by the entry's id and guarded by what the recorder last
+#     wrote to it; if the work is now another task, the turn is recorded now as it would have been,
+#     which may be the one entry of its own it would have opened;
+#   - skipped it as an exact repeat: the same, recorded now as it would have been;
+#   - replaced the open entry's description: a new note replaces it again; if the work is now
+#     another task, or the note is refused, the entry first gets back the description it had;
+#   - inserted the turn's own entry: that entry's description is replaced, guarded so a row a
+#     person has corrected since is left alone. If the work is now another task the entry is moved
+#     to it in the same guarded write, with the billable flag that task carries, and becomes the
+#     entry open for that work; but only where the installed task script can do that
+#     (move_supported in lib/writer.sh). Where it cannot, the entry stays where it was booked.
+# Whatever cannot be done that way is left exactly as the first Stop recorded it.
+#
+# The hold is remembered in sendback-held-<session>.txt (_sb_mark), which says what the first Stop
+# did. The first Stop removes the turn's prompt stamp, as it always has, so a Stop that finds the
+# file and no stamp, and is not marked as a first Stop, is the same reply going on: it takes the
+# file (one rename, so only one run can) and applies the notes. A Stop that finds a stamp, so a
+# prompt came since, or that is marked as a first Stop, just removes it. So
+# does a prompt: the held reply's Stop after the extra step can no longer come (an interrupt ends a
+# reply without one), its entry stands, and any note written in the extra step is thrown away, so
+# the next turn never takes it for its own.
+#
+# What the person sees: Claude Code shows the reason under the label "Stop hook error", which a
+# hook cannot change, so it is one plain line. It asks for one closing sentence because a step
+# that ends with no text makes Claude Code ask the session to reply again, and the reply was then
+# printed twice. It asks for one shell command because the shell's first start in a session took
+# 20 to 28 seconds of the median 32 a hold added when it was measured.
+#
+# Whether anybody is watching: Claude Code sets CLAUDE_CODE_SESSION_ATTENDED=1 and
+# CLAUDE_CODE_ENTRYPOINT=cli for an interactive session, and 0 and sdk-cli for a headless one
+# (observed on 2.1.303; neither is documented). A headless run that was held replaced its final
+# output, the text a script reads, with the time-notes acknowledgement in 11 of 15 runs. So a
+# run is held only when it is clearly attended: the attended flag is exactly 1 and the entry
+# point is set and not an SDK one. Anything else is treated as headless.
+#
+# Helper agents: their SubagentStop is not registered (hooks.json), and is ignored if it ever
+# arrives, because it carries the parent's own session id: a helper held there would write, or be
+# asked for, the parent's notes. An input carrying agent_id is never held either.
+#
+# Every hold adds one line to sendback-holds-<UTC date>.tsv in the person's Apropos folder: UTC
+# time, session id, and what was asked for (description, task, or both). Nothing else.
+# The task question is asked once per session, remembered in sendback-task-<session>.txt.
+sbheldf="$TRACK_DIR/sendback-held-$SID.txt"
+sbtaskf="$TRACK_DIR/sendback-task-$SID.txt"
+# _sb_stop_kind - sets SB_KIND to first (stop_hook_active absent or JSON false), repeat (any other
+# value) or unknown (input that cannot be read), SB_FALSE to true when the field is there and is the
+# JSON value false (a first Stop that says so, as Claude Code marks every first Stop), and SB_HELPER
+# to true when the input carries a top-level agent_id. Worked out once per run.
+SB_KIND=""; SB_HELPER=""; SB_FALSE=false
+_sb_stop_kind() {
+  [[ -n "$SB_KIND" ]] && return 0
+  SB_KIND=unknown; SB_HELPER=true; SB_FALSE=false
+  local k="" h="" f=""
+  if command -v jq >/dev/null 2>&1; then
+    # Top-level members only, so an agent_id inside a background task's details does not count.
+    IFS=$'\t' read -r k h f < <(printf '%s' "$INPUT" | jq -r '[(if (has("stop_hook_active") | not) or .stop_hook_active == false then "first" else "repeat" end), has("agent_id"), (has("stop_hook_active") and .stop_hook_active == false)] | @tsv' 2>/dev/null)
+    # jq on Windows ends its line with a carriage return.
+    f="${f%$'\r'}"
+    [[ "$k" == first || "$k" == repeat ]] && { SB_KIND="$k"; SB_HELPER="${h:-true}"; SB_FALSE="${f:-false}"; }
+  elif [[ "$INPUT" =~ ^[[:space:]]*\{ ]]; then
+    SB_HELPER=false
+    [[ "$INPUT" =~ \"agent_id\"[[:space:]]*: ]] && SB_HELPER=true
+    if ! [[ "$INPUT" =~ \"stop_hook_active\"[[:space:]]*: ]]; then SB_KIND=first
+    elif [[ "$INPUT" =~ \"stop_hook_active\"[[:space:]]*:[[:space:]]*false[[:space:]]*[,}] ]]; then SB_KIND=first; SB_FALSE=true
+    else SB_KIND=repeat; fi
+  fi
+  return 0
+}
+# Off unless switched on for the person, until the team rollout. Builtins only, here and below.
+_sb_on() {
+  case "${APROPOS_SENDBACK:-}" in
+    [Oo][Nn]|1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
+  esac
+  return 1
+}
+_sb_attended() {
+  [[ "${CLAUDE_CODE_SESSION_ATTENDED:-}" == 1 ]] || return 1
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in ''|[Ss][Dd][Kk]*) return 1 ;; esac
+  return 0
+}
+# _sb_read <file> - sets SB_V to the whole file, empty when it is missing or empty.
+_sb_read() { SB_V=""; [[ -s "$1" ]] && IFS= read -r -d '' SB_V < "$1" 2>/dev/null; return 0; }
+# The task file holds "none", in any case, with any spaces, line breaks or a leading #.
+_sb_task_none() {
+  _sb_read "$taskf"; SB_V="${SB_V//[[:space:]#]/}"
+  case "$SB_V" in [Nn][Oo][Nn][Ee]) return 0 ;; esac
+  return 1
+}
+# Something attributes the turn as record_turn reads it: a task file or project file holding a
+# number other than zero, or a folder marker.
+_sb_attributed() {
+  [[ -n "$_dir_task" || -n "$_dir_proj" ]] && return 0
+  _sb_read "$taskf"; SB_V="${SB_V//[[:space:]#]/}"
+  [[ "$SB_V" =~ ^[0-9]+$ && ! "$SB_V" =~ ^0+$ ]] && return 0
+  _sb_read "$projf"; SB_V="${SB_V//[[:space:]]/}"
+  [[ "$SB_V" =~ ^[0-9]+$ && ! "$SB_V" =~ ^0+$ ]] && return 0
+  return 1
+}
+# This turn's description is written: not blank, and changed after the prompt's stamp. A file
+# left from before the prompt does not count. With no stamp, being there is enough.
+_sb_desc_written() {
+  _sb_read "$descf"
+  [[ -n "${SB_V//[[:space:]]/}" ]] || return 1
+  [[ -e "$startf" ]] || return 0
+  [[ "$descf" -nt "$startf" ]]
+}
+
+# A prompt means a held reply's Stop after its extra step can no longer come (THE SEND-BACK): its
+# entry stands as its first Stop recorded it, and a note written in the extra step is thrown away,
+# here, before anything slow, so neither this turn nor a later one takes it for its own.
+# The same when the Stop applying the notes was cut off part way (its taken hold, sendback-held-
+# <session>.txt.apply.<pid>, is left): what it had applied stands, and nothing more is taken.
+if [[ "$EVENT" == "UserPromptSubmit" ]] && { [[ -e "$sbheldf" ]] || compgen -G "$sbheldf.apply.*" >/dev/null; }; then
+  rm -f "$sbheldf" "$sbheldf".apply.* "$descf" "$wtf" 2>/dev/null
+fi
+
 # Person resolution.
 #
 # Until 0.2.9 the person came from a list of staff logins written into this file, and a
@@ -172,20 +651,6 @@ if person_resolve "$LOGIN"; then
 else
   PERSON_UNRESOLVED="$PERSON_CAUSE"; PERSON_UNRESOLVED_ADVICE="$PERSON_ADVICE"
 fi
-
-descf="$TRACK_DIR/description-$SID.txt"
-wtf="$TRACK_DIR/worktype-$SID.txt"
-taskf="$TRACK_DIR/task-$SID.txt"
-projf="$TRACK_DIR/project-$SID.txt"
-# The worktype the model wrote is a one-shot file, deleted at the end of the turn.
-# These two are what make it survive: the session carries its last worktype, and the
-# machine remembers the worktype last used on each task so a NEW session on known
-# work does not fall back to Engineering.
-stickywtf="$TRACK_DIR/worktype-sticky-$SID.txt"
-taskwtf="$TRACK_DIR/task-worktype.tsv"
-lastf="$TRACK_DIR/last-entry-$SID.txt"
-startf="$TRACK_DIR/turnstart-$SID.txt"
-cwdf="$TRACK_DIR/cwd-$SID.txt"
 
 NOW="$(date -u +%s)"
 
@@ -289,25 +754,6 @@ transcript_path() {
 
 # Words that must never reach an invoice-facing field, whatever the source.
 APROPOS_BANNED='claude|anthropic|\bAI\b|assistant|chatbot|copilot'
-
-# Last resort before the placeholder: describe the turn from what the response
-# actually said. The final assistant text block IS this turn's answer, because Stop
-# only fires once the response is complete.
-#
-# Added 2026-08-12. The plugin README has claimed this behaviour since 0.2.0 but no
-# code implemented it, so every turn where the model forgot to write a description
-# booked "[needs description] <project>" instead. On one team machine the working
-# directory is named "Claude", so that placeholder put a literal AI reference on a
-# client-invoice-facing field, repeatedly.
-# Shortest derived description worth putting on a timesheet. Measured against 12 real
-# sessions: below this the candidates are things like "Sent", "Draft below" and
-# "Incident is closed", which say less than an honest placeholder does.
-#
-# Length alone is not enough. A floor of 60 was tried and rejected because it threw
-# out real descriptions ("Rebuilt the template and verified it at five widths.", 52).
-# The bad short candidates are conversational acknowledgements, not short work, so
-# they are matched by shape below instead.
-APROPOS_DERIVE_MIN="${APROPOS_DERIVE_MIN:-40}"
 
 # Punctuation the house style rules ban outright. Normalised rather than refused, and
 # done with bash parameter expansion rather than sed: this runs on every turn, and a
@@ -559,69 +1005,6 @@ _desc_refuse() {
   esac
   case "$p" in *" claude "*|*" anthropic "*|*" ai "*|*" assistant "*|*" chatbot "*|*" copilot "*|*" agent "*|*" subagent "*) return 0 ;; esac
 
-  return 1
-}
-
-# Clean one candidate sentence, or fail. Shared by both sources below.
-_clean_candidate() {
-  local s
-  s="$(printf '%s' "$1" \
-       | sed -e 's/[*`#|_>]/ /g' \
-             -e 's/\[\([^]]*\)\]([^)]*)/\1/g' \
-             -e 's/^[[:space:]]*[Tt]imestamp:[[:space:]]*//' \
-             -e 's/^[[:space:]]*[0-9-]\{10\}[[:space:]][0-9:]\{5,8\}[[:space:]]*UTC[[:space:]-]*//' \
-             -e 's/^[[:space:]]*[-—–][[:space:]]*//' \
-             -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//')"
-  s="${s%%. *}"; s="${s%.}"
-  (( ${#s} < APROPOS_DERIVE_MIN )) && return 1
-  # Acknowledgements, not work. "Noted, that reads well and the ask is clear" passes a
-  # length floor but describes nothing that happened.
-  printf '%s' "$s" | grep -Eqi '^(noted|sent|done|yes|no|correct|agreed|thanks|thank you|ok|okay|right|sure|understood|good|fair|exactly|indeed|got it|perfect)([^[:alnum:]]|$)' && return 1
-  # The rules ban file paths and script names from an invoice-facing field.
-  printf '%s' "$s" | grep -Eq '[A-Za-z]:\\|\\\\|/[A-Za-z0-9_.-]+/|\.(ps1|sh|js|md|php|sql|json|html|txt|csv|xlsx|jsonl|cmd|bat|py)\b' && return 1
-  printf '%s' "$s" | grep -Eqi "$APROPOS_BANNED" && return 1
-  # The same voice screen the model-written description gets, so neither route bypasses
-  # it. The derived text is the worse offender: it is lifted from a reply.
-  s="$(_desc_normalise "$s")"
-  _desc_refuse "$s" && return 1
-  (( ${#s} > DESC_MAX )) && { s="${s:0:$DESC_MAX}"; s="${s% *}"; }
-  # Sentence case, since a lifted fragment often starts mid-thought.
-  printf '%s.' "$(printf '%s' "${s:0:1}" | tr '[:lower:]' '[:upper:]')${s:1}"
-}
-
-# Last resort before the placeholder: describe the turn from what the response
-# actually said. The final assistant text block IS this turn's answer, because Stop
-# only fires once the response is complete.
-#
-# Two sources, best first: the labelled summary that ends a long reply, then the
-# reply's opening sentence. Measured across 12 real sessions, the summary is present
-# about 60% of the time and is usually a statement of what was done; the opening
-# sentence is the better of the rest. Anything failing the floor or the content rules
-# falls through to the placeholder, which is the honest outcome.
-#
-# Added 2026-08-12. The plugin README has claimed this behaviour since 0.2.0 but no
-# code implemented it, so every turn where the model forgot to write a description
-# booked "[needs description] <project>". On one team machine the working directory
-# is named "Claude", so that put a literal AI reference on an invoice-facing field.
-#
-# Only the live turn uses this, for its own new entry. The repair of an entry already flagged
-# never does (_repair_candidate says why).
-desc_from_transcript() {
-  local f raw out
-  command -v jq >/dev/null 2>&1 || return 1
-  f="$(transcript_path "$SID" "$1")" || return 1
-
-  # One line per text block, newest last. gsub collapses the block so tail -1 gets a
-  # whole block rather than its last physical line.
-  raw="$(tail -n 800 "$f" 2>/dev/null \
-        | jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text | gsub("\\s+"; " ")' 2>/dev/null \
-        | awk 'NF' | tail -n 1)"
-  [[ -n "$raw" ]] || return 1
-
-  case "$raw" in
-    *"Summary:"*) out="$(_clean_candidate "${raw##*Summary:}")" && { printf '%s' "$out"; return 0; } ;;
-  esac
-  out="$(_clean_candidate "$raw")" && { printf '%s' "$out"; return 0; }
   return 1
 }
 
@@ -1292,16 +1675,47 @@ _tw_lock() {
 # The start of the turn record_turn has just recorded, whose session's earlier flags the end of
 # this file then revisits. Empty when there is no person to repair for.
 RT_REPAIR_SKIP=""
+# For the Stop after a send-back's extra step (THE SEND-BACK, _sb_apply), set for one call:
+#   RT_DESC_SET=1  the description is RT_DESC_VAL, already screened and flagged where it has to be,
+#                  not the description file; RT_DESC_WROTE=1 when it is one the session wrote and
+#                  the screen accepted
+#   RT_WT_SET=1    the worktype is RT_WT_VAL, from RT_WTSRC_VAL (w t s d), as the turn's first Stop
+#                  would have worked it out with the notes written, not from the files as they are
+RT_DESC_SET=0; RT_DESC_VAL=""; RT_DESC_WROTE=0; RT_WT_SET=0; RT_WT_VAL=""; RT_WTSRC_VAL=""
+# What record_turn did, for the send-back to remember (_sb_mark): RT_OUT_K is insert (queued its
+# own entry), withheld (a flag absorbed into the open entry RT_OUT_ID, nothing written), merged
+# (the open entry RT_OUT_ID amended; RT_OUT_PREV is the description the recorder had last written
+# to it, base64), dedup (an exact repeat, nothing written) or unresolved (queued for a person not
+# yet identified). The rest is the entry as recorded: RT_OUT_DESC, RT_OUT_WT, RT_OUT_WTSRC (w t s
+# d), RT_OUT_TASK, RT_OUT_PROJ, and RT_OUT_STICKY0, the session's worktype before this turn.
+RT_OUT_K=""; RT_OUT_ID=""; RT_OUT_PREV=""; RT_OUT_DESC=""; RT_OUT_WT=""; RT_OUT_WTSRC=""
+RT_OUT_TASK=""; RT_OUT_PROJ=""; RT_OUT_STICKY0=""
+
+# _rt_attr - sets RT_TASK and RT_PROJ to the task and project record_turn reads: the task and
+# project files, a number or 0, then the folder's markers where they are 0.
+_rt_attr() {
+  RT_TASK="0"; [[ -s "$taskf" ]] && RT_TASK="$(tr -d '[:space:]#' < "$taskf")"; [[ "$RT_TASK" =~ ^[0-9]+$ ]] || RT_TASK="0"
+  RT_PROJ="0"; [[ -s "$projf" ]] && RT_PROJ="$(tr -d '[:space:]' < "$projf")"; [[ "$RT_PROJ" =~ ^[0-9]+$ ]] || RT_PROJ="0"
+  # The folder answers when the session did not. A session that states its own task still
+  # wins, so a marker never overrides a deliberate choice; it only fills a silence that
+  # would otherwise have become somebody else's invoice.
+  if [[ "$RT_TASK" == "0" && -n "$_dir_task" ]]; then RT_TASK="$_dir_task"; fi
+  if [[ "$RT_PROJ" == "0" && -n "$_dir_proj" ]]; then RT_PROJ="$_dir_proj"; fi
+  return 0
+}
 
 record_turn() {
   # $1 = start time as UTC "YYYY-MM-DD HH:MM:SS"
   local START="$1"
+  RT_OUT_K=""; RT_OUT_ID=""; RT_OUT_PREV="-"; RT_OUT_STICKY0="-"
 
-  # Description, best source first:
-  #   1. the model-written file, which is the intended path
-  #   2. the last assistant message from the transcript
-  #   3. a flagged placeholder
-  # Never the raw prompt, which describes the request rather than the work done.
+  # Description: the file the session wrote, or a flag. Nothing else, ever: not the prompt, not
+  # the session's replies, not the transcript, not the last reply carried in the Stop input.
+  # Until this change a turn with no description took one from the session's last reply, and
+  # that put private figures from a personal conversation into an entry's description. A flag
+  # is visible and gets corrected; a description lifted from a conversation reads as finished,
+  # and can carry anything the conversation held. Where it is switched on, the session is
+  # asked for its note before the reply ends instead (THE SEND-BACK, above).
   local DESC=""
   # Whether the screen threw away a description this turn. The recorder has always known
   # this at the moment of refusal and then discarded it before writing the entry, which
@@ -1310,11 +1724,12 @@ record_turn() {
   local REFUSED=0
   # Whether this turn's description is one the session wrote and the screen accepted.
   local WROTE=0
-  if [[ -s "$descf" ]]; then
+  if (( RT_DESC_SET )); then
+    DESC="$RT_DESC_VAL"; WROTE="$RT_DESC_WROTE"
+  elif [[ -s "$descf" ]]; then
     DESC="$(_desc_normalise "$(cat "$descf")")"
-    # A supplied description is held to the same standard as a derived one. Refusing it
-    # falls through to the transcript and then to the flagged placeholder, which is
-    # visible and gets corrected, rather than shipping a reply onto an invoice.
+    # Screened before it is used. Refusing it falls through to the flagged placeholder,
+    # which is visible and gets corrected, rather than shipping a reply onto an invoice.
     if _desc_refuse "$DESC"; then
       printf 'apropos: the description written this turn reads as a reply rather than a record of the work, so it was not used. Rewrite it in the past tense, from your own perspective, saying what was accomplished.\n' >&2
       DESC=""
@@ -1327,18 +1742,9 @@ record_turn() {
   fi
   local basecwd="$CWD"
   [[ -z "$basecwd" && -s "$cwdf" ]] && basecwd="$(cat "$cwdf")"
-  # APROPOS_DERIVE=off keeps the old behaviour, for anyone who would rather see an
-  # explicit placeholder to correct than an approximate description that reads as
-  # finished. The derived text is a safety net; the model writing one is the fix.
-  case "$(printf '%s' "${APROPOS_DERIVE:-on}" | tr '[:upper:]' '[:lower:]')" in
-    off|0|false|no) ;;
-    *) [[ -z "${DESC//[[:space:]]/}" ]] && DESC="$(desc_from_transcript "$basecwd" 2>/dev/null)" ;;
-  esac
   if [[ -z "${DESC//[[:space:]]/}" ]]; then
-    # Which flag. A refused TRANSCRIPT is not a rejection: the transcript is a salvage
-    # attempt, not a description the session wrote, so it stays the never-written cause.
-    # Counting it against the screen would inflate the one number this exists to make
-    # trustworthy. Only a description the session actually wrote can be rejected.
+    # Which flag. Only a description the session actually wrote can be rejected; nothing
+    # written is the other cause.
     local ph="$DESC_PH_NONE"
     (( REFUSED )) && ph="$DESC_PH_REJECTED"
     local proj; proj="$(basename "$basecwd" 2>/dev/null)"
@@ -1358,16 +1764,10 @@ record_turn() {
   fi
   DESC="${DESC:0:$DESC_MAX}"
 
-  # Optional sticky task/project. Resolved BEFORE the worktype, because the worktype can
-  # be inherited from the task.
-  local TASK="0"; [[ -s "$taskf" ]] && TASK="$(tr -d '[:space:]#' < "$taskf")"; [[ "$TASK" =~ ^[0-9]+$ ]] || TASK="0"
-  local PROJ="0"; [[ -s "$projf" ]] && PROJ="$(tr -d '[:space:]' < "$projf")"; [[ "$PROJ" =~ ^[0-9]+$ ]] || PROJ="0"
-
-  # The folder answers when the session did not. A session that states its own task still
-  # wins, so a marker never overrides a deliberate choice; it only fills a silence that
-  # would otherwise have become somebody else's invoice.
-  if [[ "$TASK" == "0" && -n "$_dir_task" ]]; then TASK="$_dir_task"; fi
-  if [[ "$PROJ" == "0" && -n "$_dir_proj" ]]; then PROJ="$_dir_proj"; fi
+  # Optional sticky task/project, with the folder's markers filling a silence (_rt_attr).
+  # Resolved BEFORE the worktype, because the worktype can be inherited from the task.
+  _rt_attr
+  local TASK="$RT_TASK" PROJ="$RT_PROJ"
 
   # A description the session wrote and the screen accepted is kept, with its task and
   # project, so it can fill this session's flagged entries on the same work (_sd_record).
@@ -1390,7 +1790,11 @@ record_turn() {
   # end of every turn, so only the first turn of a stretch was categorised as intended.
   # Everything after it booked as Engineering.
   local WT="" WTSRC="" v=""
-  if [[ -s "$wtf" ]]; then
+  if (( RT_WT_SET )); then
+    WT="$RT_WT_VAL"
+    case "$RT_WTSRC_VAL" in w) WTSRC="written this turn" ;; t) WTSRC="last used on this task" ;; s) WTSRC="carried from this session" ;; *) WTSRC="default" ;; esac
+  fi
+  if [[ -z "$WT" && -s "$wtf" ]]; then
     v="$(tr -d '[:space:]' < "$wtf")"
     if [[ "$v" =~ ^[0-9]+$ ]]; then WT="$v"; WTSRC="written this turn"; fi
   fi
@@ -1407,6 +1811,10 @@ record_turn() {
     printf 'apropos: no worktype was written this turn and none is on record for task %s, so this entry took the default worktype 13 (Engineering). Correct it if that is wrong.
 ' "$TASK" >&2
   fi
+  # What the session carried before this turn, for the send-back (RT_OUT_STICKY0).
+  # Builtins only: this runs on every turn, the send-back on or not.
+  _sb_read "$stickywtf"; RT_OUT_STICKY0="${SB_V//[[:space:]]/}"
+  [[ "$RT_OUT_STICKY0" =~ ^[0-9]+$ ]] || RT_OUT_STICKY0="-"
   printf '%s' "$WT" > "$stickywtf" 2>/dev/null || true
   # Only a chosen worktype is worth remembering for the task. Recording the bare default
   # would pin a guess into the shared map as though somebody had established it, and
@@ -1493,6 +1901,10 @@ record_turn() {
           # because only this turn's description is tested here.
           if _desc_is_placeholder "$DESC"; then
             MERGED=1; WITHHELD="$id"
+            # What the recorder last wrote to it, for the send-back (_sb_apply).
+            # "id epoch b64", the b64 empty when nothing was recorded; no subprocess.
+            local _op1 _op2; RT_OUT_PREV=""; read -r _op1 _op2 RT_OUT_PREV <<< "$open"
+            RT_OUT_PREV="${RT_OUT_PREV:--}"
           else
             # Third field is what this recorder last wrote for that entry. Pass it back so
             # the writer can refuse the amend if the row has been corrected since. A refusal
@@ -1515,7 +1927,7 @@ record_turn() {
               fi
             fi
             if (( amend_ok )) && amend_entry "$id" "$PERSON" "$DESC" "$expect"; then
-              MERGED=1
+              MERGED=1; RT_OUT_ID="$id"; RT_OUT_PREV="${expect_b64:--}"
               # The row now holds this turn's description, so that is what the next amend must
               # expect. Left at the insert's text, every amend after the second was refused as
               # though a person had corrected the row, and the work split into extra entries.
@@ -1582,7 +1994,9 @@ record_turn() {
   if [[ $MERGED -eq 0 && $DEDUP -eq 0 ]]; then
     if [[ -n "$PERSON" ]]; then
       q_enqueue "$QUEUE" "$PERSON" "$DESC" "$WT" "$TASK" "$PROJ" "$START"
+      RT_OUT_K=insert
     else
+      RT_OUT_K=unresolved
       # Kept, not dropped: queued under the login, and delivered once the login resolves to
       # a person. Said on this turn, plainly, because a silent miss is how a person used to
       # lose days of time without knowing.
@@ -1633,6 +2047,14 @@ record_turn() {
     fi
   fi
 
+  # What was done, for the send-back (_sb_mark), set straight after the entry is settled.
+  if [[ -z "$RT_OUT_K" ]]; then
+    if (( DEDUP )); then RT_OUT_K=dedup
+    elif [[ -n "$WITHHELD" ]]; then RT_OUT_K=withheld; RT_OUT_ID="$WITHHELD"
+    else RT_OUT_K=merged; fi
+  fi
+  RT_OUT_DESC="$DESC"; RT_OUT_WT="$WT"; RT_OUT_TASK="$TASK"; RT_OUT_PROJ="$PROJ"
+  case "$WTSRC" in "written this turn") RT_OUT_WTSRC=w ;; "last used on this task") RT_OUT_WTSRC=t ;; "carried from this session") RT_OUT_WTSRC=s ;; *) RT_OUT_WTSRC=d ;; esac
 
   # Tell the person, visibly, which entries went to the catch-all today, by local start time and
   # description. Visibly means the systemMessage: until now this was a line on the hook's
@@ -1665,6 +2087,7 @@ record_turn() {
   # for the next session but can never cost the time itself.
   [[ "$WTSRC" != "default" ]] && task_wt_record "$TASK" "$WT"
 
+  # The turn's notes are used up.
   rm -f "$descf" "$wtf" 2>/dev/null || true
 
   # This session's earlier flags are revisited once the hook has done everything else (the end
@@ -1674,13 +2097,291 @@ record_turn() {
   return 0
 }
 
+# THE SEND-BACK, after the turn is recorded (above).
+#
+# _sb_b64 <text> - the text as one line of base64, "-" for none.
+_sb_b64() { [[ -n "$1" ]] || { printf '%s' -; return 0; }; printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# _sb_mark <start> <asked> - remember the hold and what the first Stop did, one tab-separated line:
+#   3, start, what was done (RT_OUT_K), entry id or -, worktype, task, project, where the worktype
+#   came from (w t s d), the session's worktype before the turn or -, the description recorded
+#   (base64), the description the open entry had before it was amended (base64, or -), the epoch
+#   of the recording, and what was asked for.
+# Fails, and the reply is not held, when the line cannot be written: with nothing to say what the
+# first Stop did, the notes could not be applied to it.
+_sb_mark() {
+  local d; d="$(_sb_b64 "$RT_OUT_DESC")"
+  [[ -n "$d" && "$d" != - ]] || return 1
+  printf '3\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$RT_OUT_K" "${RT_OUT_ID:--}" "$RT_OUT_WT" "$RT_OUT_TASK" "$RT_OUT_PROJ" "$RT_OUT_WTSRC" "${RT_OUT_STICKY0:--}" "$d" "${RT_OUT_PREV:--}" "$NOW" "$2" > "$sbheldf" 2>/dev/null && [[ -s "$sbheldf" ]]
+}
+
+# _sb_take - take the hold for this run: one rename, so of two runs only one can, then read it.
+# Sets SB_TAKEN (the renamed file), SB_START, SB_K, SB_ID, SB_WT, SB_T, SB_P, SB_WS, SB_S0, SB_D1
+# (the description recorded), SB_PREV (the open entry's description before, or empty) and SB_N1.
+# Returns 1 when another run took it first: that run applies the notes, so this one touches
+# nothing. Returns 2 when the line is not in full form: it is removed and nothing is applied, so the
+# first recording stands.
+SB_TAKEN=""
+_sb_take() {
+  local v st k id wt t p ws s0 d1 prev n1 why
+  SB_TAKEN="$sbheldf.apply.$$"
+  mv -f "$sbheldf" "$SB_TAKEN" 2>/dev/null || { SB_TAKEN=""; return 1; }
+  IFS=$'\t' read -r v st k id wt t p ws s0 d1 prev n1 why < "$SB_TAKEN" 2>/dev/null
+  if [[ "$v" == 3 && "$st" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ \
+        && "$k" =~ ^(insert|withheld|merged|dedup)$ && ( "$id" == - || "$id" =~ ^[0-9]{1,18}$ ) \
+        && "$wt" =~ ^[0-9]{1,9}$ && "$t" =~ ^[0-9]{1,12}$ && "$p" =~ ^[0-9]{1,12}$ && "$ws" =~ ^[wtsd]$ \
+        && ( "$s0" == - || "$s0" =~ ^[0-9]{1,9}$ ) && "$d1" =~ ^[A-Za-z0-9+/=]+$ \
+        && ( "$prev" == - || "$prev" =~ ^[A-Za-z0-9+/=]+$ ) && "$n1" =~ ^[0-9]{1,12}$ ]]; then
+    SB_START="$st"; SB_K="$k"; SB_ID="${id#-}"; SB_WT="$wt"; SB_T="$t"; SB_P="$p"; SB_WS="$ws"
+    SB_S0="${s0#-}"; SB_N1="$n1"
+    SB_D1="$(printf '%s' "$d1" | base64 -d 2>/dev/null)"
+    SB_PREV=""; [[ "$prev" != - ]] && SB_PREV="$(printf '%s' "$prev" | base64 -d 2>/dev/null)"
+    # Merged and withheld turns name the open entry they went into.
+    if [[ -n "$SB_D1" ]] && { [[ "$k" != merged && "$k" != withheld ]] || [[ -n "$SB_ID" ]]; }; then return 0; fi
+  fi
+  rm -f "$SB_TAKEN" 2>/dev/null; SB_TAKEN=""
+  return 2
+}
+
+# _sb_done - the extra step's notes are used up, and so is the hold.
+_sb_done() { rm -f "$descf" "$wtf" ${SB_TAKEN:+"$SB_TAKEN"} 2>/dev/null; SB_TAKEN=""; return 0; }
+
+# _sb_queued - true while this person's entry at the held start is still waiting in the queue.
+_sb_queued() {
+  local qp qd qw qt qj qs qa
+  [[ -s "$QUEUE" && -n "$PERSON" ]] || return 1
+  while IFS=$'\t' read -r qp qd qw qt qj qs qa; do
+    [[ "$qp" == "$PERSON" && "$qs" == "$SB_START" ]] && return 0
+  done < "$QUEUE"
+  return 1
+}
+
+# _sb_rerecord - record the held turn as its first Stop would have with the notes now written:
+# the description SB_A_D2 and worktype SB_A_WT2 as worked out, the task and project from the
+# files. Used only when the first Stop wrote nothing of the turn's own (or only amended the open
+# entry, and that has been put back), so this is the turn's one recording, and the one entry it may
+# open is the one 0.2.13 would have opened. It cannot be made twice: only the run that took the hold
+# (_sb_take, one rename) gets here, and the hold is written once, by the turn's first Stop.
+_sb_rerecord() {
+  RT_DESC_SET=1; RT_DESC_VAL="$SB_A_D2"; RT_DESC_WROTE="$SB_A_W2"
+  RT_WT_SET=1; RT_WT_VAL="$SB_A_WT2"; RT_WTSRC_VAL="$SB_A_WS2"
+  record_turn "$SB_START"
+  RT_DESC_SET=0; RT_DESC_VAL=""; RT_DESC_WROTE=0; RT_WT_SET=0; RT_WT_VAL=""; RT_WTSRC_VAL=""
+  return 0
+}
+
+# _sb_apply - the Stop after the extra step: what the first Stop recorded (_sb_take) is made what it
+# would have been had the notes been written before it (THE SEND-BACK, above). Works out the notes
+# as they now stand into SB_A_D2 (the description, screened and flagged as record_turn would),
+# SB_A_W2 (1 when it is the session's own accepted words), SB_A_T2, SB_A_P2, SB_A_WT2 and SB_A_WS2,
+# then acts on what was done. An inserted entry still waiting in the queue is left until this
+# hook's delivery has run (SB_LATE=1, then _sb_apply_insert).
+SB_LATE=0
+_sb_apply() {
+  SB_LATE=0
+  local raw v bc a1 a2
+  SB_A_D2="$SB_D1"; SB_A_W2=0
+  if [[ -s "$descf" ]]; then
+    raw="$(_desc_normalise "$(cat "$descf")")"
+    if [[ -n "${raw//[[:space:]]/}" ]]; then
+      if _desc_refuse "$raw"; then
+        printf 'apropos: the description written this turn reads as a reply rather than a record of the work, so it was not used. Rewrite it in the past tense, from your own perspective, saying what was accomplished.\n' >&2
+        bc="$CWD"; [[ -z "$bc" && -s "$cwdf" ]] && bc="$(cat "$cwdf")"
+        SB_A_D2="$(_flag_text_for_cwd "$DESC_PH_REJECTED" "$bc")"
+      else
+        SB_A_D2="$raw"; SB_A_W2=1
+      fi
+      SB_A_D2="${SB_A_D2:0:$DESC_MAX}"
+    fi
+  fi
+  _rt_attr; SB_A_T2="$RT_TASK"; SB_A_P2="$RT_PROJ"
+  # The worktype record_turn would have taken: a file written for the turn, now or before its first
+  # Stop, then the one last used on the task, then what the session carried before the turn.
+  SB_A_WT2=13; SB_A_WS2=d
+  v=""; [[ -s "$wtf" ]] && v="$(tr -d '[:space:]' < "$wtf")"
+  if [[ "$v" =~ ^[0-9]+$ ]]; then SB_A_WT2="$v"; SB_A_WS2=w
+  elif [[ "$SB_WS" == w ]]; then SB_A_WT2="$SB_WT"; SB_A_WS2=w
+  elif v="$(task_wt_lookup "$SB_A_T2" 2>/dev/null)" && [[ "$v" =~ ^[0-9]+$ ]]; then SB_A_WT2="$v"; SB_A_WS2=t
+  elif [[ "$SB_S0" =~ ^[0-9]+$ ]]; then SB_A_WT2="$SB_S0"; SB_A_WS2=s
+  fi
+  a1="$SB_WT|$SB_T|$SB_P"; a2="$SB_A_WT2|$SB_A_T2|$SB_A_P2"
+  # Nothing new: the first recording is what it would have been.
+  [[ "$a2" == "$a1" && "$SB_A_D2" == "$SB_D1" ]] && return 0
+  case "$SB_K" in
+    withheld)
+      if [[ "$a2" == "$a1" ]]; then
+        # Still a flag on the same work: absorbed into the open entry again, nothing to write.
+        # Otherwise the note replaces the open entry's description, as the turn's own amend would
+        # have, guarded by what the recorder had last written to it (_sb_amend_open).
+        _desc_is_placeholder "$SB_A_D2" || _sb_amend_open "$SB_PREV"
+        return 0
+      fi
+      _sb_rerecord ;;
+    dedup)
+      _sb_rerecord ;;
+    merged)
+      # The open entry was given this turn's description. A new note for the same work replaces
+      # it. Otherwise the entry gets back the description it had, guarded like every amend.
+      if [[ "$a2" == "$a1" ]] && ! _desc_is_placeholder "$SB_A_D2"; then _sb_amend_open "$SB_D1"; return 0; fi
+      if [[ "$a2" != "$a1" ]] || _desc_is_placeholder "$SB_A_D2"; then
+        if [[ -n "$SB_PREV" ]] && amend_entry "$SB_ID" "$PERSON" "$SB_PREV" "$SB_D1"; then
+          oe_update_desc "$a1" "$SB_ID" "$(_sb_b64 "$SB_PREV")" || true
+        fi
+        [[ "$a2" == "$a1" ]] && return 0
+      fi
+      _sb_rerecord ;;
+    insert)
+      if _sb_queued; then SB_LATE=1; else _sb_apply_insert; fi ;;
+  esac
+  return 0
+}
+
+# _sb_amend_open <expect> - replace the description of the open entry the first Stop put the turn in
+# (SB_ID) with the note, expecting <expect>. By the entry's id, not by looking the work up again, so
+# the merge window closing during the extra step cannot turn it into a new entry. Refused, the
+# entry has been corrected by a person since, and is left as it is: nothing is added.
+_sb_amend_open() {
+  (( SB_A_W2 )) && _sd_record "$SB_START" "$SB_T|$SB_P" "$SB_A_D2"
+  if amend_entry "$SB_ID" "$PERSON" "$SB_A_D2" "$1"; then
+    oe_update_desc "$SB_WT|$SB_T|$SB_P" "$SB_ID" "$(_sb_b64 "$SB_A_D2")" || true
+  fi
+  return 0
+}
+
+# _sb_apply_insert - the first Stop inserted the turn's own entry. Its description is replaced,
+# guarded by the one recorded (the amend scripts refuse a row that no longer holds it, so a
+# correction made since is kept). If the turn is now another task, and the installed task script
+# can do it, the entry is moved there in the same guarded write, taking that task's billable flag,
+# and becomes the entry open for that work. What cannot be written now is left as recorded; an
+# accepted description is still kept for the repair of flagged entries, which fills a flag later.
+_sb_apply_insert() {
+  local a1="$SB_WT|$SB_T|$SB_P" a2="$SB_A_WT2|$SB_A_T2|$SB_A_P2" id="" rc o oid ob
+  [[ -n "$PERSON" ]] || return 0
+  id="$(ei_lookup "$PERSON" "$SB_START" 2>/dev/null)" || id=""
+  if [[ "$a2" != "$a1" && "$SB_A_T2" != 0 ]] && move_supported; then
+    move_entry "$id" "$SB_START" "$PERSON" "$SB_A_T2" "$SB_A_WT2" "$SB_A_D2" "$SB_D1"; rc=$?
+    if (( rc == 0 )); then
+      [[ -n "$MOVE_ID" ]] && id="$MOVE_ID"
+      if [[ -n "$id" ]]; then
+        oe_forget "$a1" "$id"
+        oe_record "$a2" "$id" "$(_sb_b64 "$SB_A_D2")"
+      fi
+      printf '%s' "$SB_A_WT2" > "$stickywtf" 2>/dev/null
+      [[ "$SB_A_WS2" != d ]] && task_wt_record "$SB_A_T2" "$SB_A_WT2"
+      if _desc_is_placeholder "$SB_A_D2"; then _sd_flag "$SB_START" "$SB_A_T2|$SB_A_P2" "$SB_A_WT2"
+      elif _desc_is_placeholder "$SB_D1"; then fl_clear "$SB_START"; fi
+      (( SB_A_W2 )) && _sd_record "$SB_START" "$SB_A_T2|$SB_A_P2" "$SB_A_D2"
+      _sb_lastf
+      return 0
+    fi
+    # Refused: the entry no longer holds what was recorded, so a person has corrected it.
+    (( rc == 2 )) && return 0
+  fi
+  [[ "$SB_A_D2" == "$SB_D1" ]] && return 0
+  if [[ -n "$id" ]]; then amend_entry "$id" "$PERSON" "$SB_A_D2" "$SB_D1"; rc=$?
+  else amend_by_start "$SB_START" "$PERSON" "$SB_A_D2" "$SB_D1"; rc=$?; fi
+  if (( rc == 0 )); then
+    # The open-entry record for the work, where it is this entry, now expects the new text.
+    if [[ "$SB_T" != 0 ]] && o="$(oe_lookup "$a1")"; then
+      oid="${o%% *}"; ob="${o##* }"
+      if [[ -n "$id" && "$oid" == "$id" ]] || [[ -z "$id" && "$ob" == "$(_sb_b64 "$SB_D1")" ]]; then
+        oe_update_desc "$a1" "$oid" "$(_sb_b64 "$SB_A_D2")" || true
+      fi
+    fi
+    _desc_is_placeholder "$SB_D1" && ! _desc_is_placeholder "$SB_A_D2" && fl_clear "$SB_START"
+    (( SB_A_W2 )) && _sd_record "$SB_START" "$SB_T|$SB_P" "$SB_A_D2"
+    _sb_lastf
+  elif (( rc != 2 )); then
+    (( SB_A_W2 )) && _sd_record "$SB_START" "$SB_T|$SB_P" "$SB_A_D2"
+  fi
+  return 0
+}
+
+# _sb_lastf - the exact-repeat guard remembers the entry as it now is, if it still remembers the
+# first Stop's.
+_sb_lastf() {
+  local line
+  [[ -s "$lastf" ]] || return 0
+  line="$(head -1 "$lastf")"
+  [[ "${line%%|*}" == "$SB_N1" ]] && printf '%s|%s\n' "$SB_N1" "$SB_A_WT2|$SB_A_T2|$SB_A_P2|$(_hash "$SB_A_D2")" > "$lastf" 2>/dev/null
+  return 0
+}
+
 case "$EVENT" in
   Stop)
     # Primary recorder. Use the start time stamped when the prompt came in, so the
     # marker sits at the real beginning of the work rather than at its end.
-    START="$(start_from_stamp "$startf")"
-    record_turn "$START"
-    rm -f "$startf" 2>/dev/null || true
+    #
+    # A hold and no stamp: this is the held reply going on after its extra step (THE SEND-BACK).
+    # Its notes are applied to what its first Stop recorded, and it is never held again. Not a Stop
+    # marked as a first one (stop_hook_active false), though: Claude Code marks the Stop after the
+    # extra step true, so a false one is either a new reply whose prompt left no stamp (its hook did
+    # not run) or the same first Stop sent twice: it is recorded as any Stop, as 0.2.13 records it,
+    # its notes its own, and it is never held, since a hold has just been made with no prompt since.
+    # The field missing altogether, as from an older Claude Code, still counts as the same reply
+    # going on.
+    _sb_cont=0; _sb_nohold=0
+    if [[ -e "$sbheldf" ]]; then
+      _sb_stop_kind
+      if [[ -e "$startf" ]]; then rm -f "$sbheldf" 2>/dev/null
+      elif [[ "$SB_FALSE" == true ]]; then rm -f "$sbheldf" 2>/dev/null; _sb_nohold=1
+      else _sb_cont=1; fi
+    fi
+    if (( _sb_cont )); then
+      _sb_rc=2
+      [[ -n "$PERSON" ]] && { _sb_take; _sb_rc=$?; }
+      if (( _sb_rc == 0 )); then
+        _sb_apply
+        (( SB_LATE )) || _sb_done
+      elif (( _sb_rc == 2 )); then
+        # The notes cannot be applied (the hold cannot be read, or the person cannot be identified
+        # now): the turn stands as first recorded, and the extra step's notes are thrown away, so a
+        # later prompt never records them as a turn of their own.
+        rm -f "$sbheldf" "$descf" "$wtf" 2>/dev/null
+      fi
+      [[ -n "$PERSON" && -n "${SB_START:-}" ]] && RT_REPAIR_SKIP="$SB_START"
+    else
+      # Whether to send the reply back is worked out before recording, which uses up the
+      # description file, and acted on only once the turn is recorded.
+      _sb_want=0; _sb_nd=0; _sb_nt=0
+      if [[ "$SID" != nosession && -n "$PERSON" ]] && (( ! _sb_nohold )) && _sb_on && _sb_attended; then
+        _sb_stop_kind
+        if [[ "$SB_KIND" == first && "$SB_HELPER" == false ]]; then
+          _sb_desc_written || _sb_nd=1
+          if [[ ! -e "$sbtaskf" ]] && ! _sb_attributed && ! _sb_task_none; then _sb_nt=1; fi
+          (( _sb_nd || _sb_nt )) && _sb_want=1
+        fi
+      fi
+      START="$(start_from_stamp "$startf")"
+      record_turn "$START"
+      rm -f "$startf" 2>/dev/null || true
+      _sb_why=task; (( _sb_nd )) && _sb_why=description; (( _sb_nd && _sb_nt )) && _sb_why="description,task"
+      # Held only once the hold is on disk and the stamp is gone, which is how the Stop after the
+      # extra step knows it is the same reply. Otherwise the turn simply stands as recorded.
+      [[ "$RT_OUT_K" == unresolved ]] && _sb_want=0
+      [[ "$RT_OUT_K" == insert && "$RT_OUT_TASK" == 0 && "$RT_OUT_PROJ" != 0 ]] && _sb_want=0
+      if (( _sb_want )) && [[ ! -e "$startf" ]] && _sb_mark "$START" "$_sb_why"; then
+        (( _sb_nt )) && : > "$sbtaskf" 2>/dev/null
+        # The kept entry ids lose their lines older than a day, here rather than in a delivery.
+        ei_prune
+        # The count of holds, for measuring them: time, session and what was asked for. Nothing from
+        # the conversation, no description and no path.
+        {
+          TZ=UTC0 printf -v _sb_day '%(%Y-%m-%d)T' -1
+          TZ=UTC0 printf '%(%H:%M:%S)T\t%s\t%s\n' -1 "${SID//[[:cntrl:]]/?}" "$_sb_why" >> "${HOME}/.claude/apropos-time/sendback-holds-$_sb_day.tsv"
+        } 2>/dev/null
+        # What to write, worded so a session that follows it literally writes a line the description
+        # screen keeps: QA found "first-person" read as "I rebuilt ...", which the screen refuses.
+        _sb_line="write one line to $descf that starts with a past-tense verb, such as Rebuilt or Answered, and says what this reply did"
+        if (( _sb_nd && _sb_nt )); then
+          SB_REASON="Time notes: in one shell command, $_sb_line, and write its task number, or none if it has no task, to $taskf. Then close with one short sentence."
+        elif (( _sb_nd )); then
+          SB_REASON="Time notes: in one shell command, $_sb_line. Then close with one short sentence."
+        else
+          SB_REASON="Time notes: in one shell command, write this work's task number, or none if it has no task, to $taskf. Then close with one short sentence."
+        fi
+      fi
+    fi
     ;;
   Sweep)
     # Once-a-day repair pass across the WHOLE ledger, triggered from session-init.sh's
@@ -1701,7 +2402,8 @@ case "$EVENT" in
   *)
     # UserPromptSubmit. Recovery first: a leftover description file means Stop did
     # not run for the previous turn (crash, kill, Stop not registered). Record it
-    # with that turn's stamped start so the work is not lost.
+    # with that turn's stamped start so the work is not lost. A hold's notes were removed
+    # above (THE SEND-BACK): its Stop recorded it.
     if [[ -s "$descf" ]]; then
       record_turn "$(start_from_stamp "$startf")"
     fi
@@ -1718,7 +2420,8 @@ case "$EVENT" in
     [[ "$_cur" =~ ^[0-9]+$ && "$_cur" != 0 ]] || _cur="$_dir_task"
     _cpj=""; [[ -s "$projf" ]] && IFS= read -r -d '' _cpj < "$projf" 2>/dev/null; _cpj="${_cpj//[[:space:]]/}"
     [[ "$_cpj" =~ ^[0-9]+$ && "$_cpj" != 0 ]] || _cpj="$_dir_proj"
-    if [[ -z "$_cur" && -z "$_cpj" ]]; then
+    # A session that has written none, with the send-back on, has said its work has no task.
+    if [[ -z "$_cur" && -z "$_cpj" ]] && ! { _sb_on && _sb_task_none; }; then
       APROPOS_CONTEXT="Time recording: no task is set for this session, so its time is going to the person's catch-all task. If this turn's work belongs to a task (one the person named for this work, one you were asked or dispatched to work on, or one you read or change, branch or commit for in doing the work), write its number to $taskf before the turn ends. A task you only read for reference, mention in passing, or file as a follow-up is not this session's task. Do not mention this note."
     fi
     ;;
@@ -1751,6 +2454,14 @@ if [[ "${APROPOS_FLUSH_DEADLINE:-}" =~ ^[0-9]+$ ]] && (( APROPOS_FLUSH_DEADLINE 
   _tf_deadline="$APROPOS_FLUSH_DEADLINE"
 fi
 APROPOS_FLUSH_DEADLINE="$_tf_deadline" q_flush "$QUEUE" write_entry
+
+# The held reply's own entry was still waiting to be delivered when its notes came (THE SEND-BACK):
+# they are applied now the delivery has run. If it is still not delivered, an accepted description
+# is kept for the repair of flagged entries, and the entry otherwise stands as recorded.
+if (( SB_LATE )); then
+  _sb_apply_insert
+  _sb_done
+fi
 
 # Last of all, revisit this session's earlier flags (record_turn sets RT_REPAIR_SKIP to the
 # turn's own start, which is skipped). A description the session has written since a flag, for
