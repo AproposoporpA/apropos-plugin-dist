@@ -6,7 +6,7 @@ Time entries are START MARKERS only — the start of a new activity ends the pri
 
 This replaced one-entry-per-turn on 2026-08-13, after four days produced over three hundred entries, 185 of them under five minutes and 20 of zero length.
 
-**Writing a specific description each turn is REQUIRED, not optional.** If you don't, the entry is recorded with a flagged placeholder, which the user then has to find and fix. Nothing is ever taken from the conversation to fill it. That is a failure on your part. Always write a concrete description of what was actually done.
+**Writing a specific description each turn is REQUIRED, not optional.** If you don't, the hook may fall back to your last reply in the session transcript, which refuses conversational acknowledgements, anything carrying a file path and anything naming the tooling, so it often lands on a flagged placeholder instead; for some people the fallback is off and the entry is always flagged. Either way the user then has to find and fix it. That is a failure on your part. Always write a concrete description of what was actually done.
 
 For some people the hook asks for the notes when a reply ends without them: once per turn for the description, and at most once per session for the task. When it asks, write the files it names in one shell command, then close with one short sentence. If the work has no task, write `none` to the task file, and you will not be asked about the task again in this session.
 

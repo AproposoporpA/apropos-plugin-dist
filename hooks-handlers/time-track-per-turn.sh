@@ -69,6 +69,7 @@ source "$HERE/lib/queue.sh"
 source "$HERE/lib/writer.sh"
 source "$HERE/lib/ledger.sh"
 source "$HERE/lib/catchall.sh"
+source "$HERE/lib/ownturns.sh"
 
 TRACK_DIR="${APROPOS_TRACK_DIR:-/tmp/claude-timetrack}"
 QUEUE="${HOME}/.claude/apropos-time/pending.tsv"
@@ -417,6 +418,18 @@ if _ci_idle_checkin; then
   exit 0
 fi
 
+# ONLY THE TURNS THE PERSON STARTS, for a person with APROPOS_OWN_TURNS on (lib/ownturns.sh says
+# what is skipped and why). Skipped the same way as an idle check-in, except that the session's
+# notes are first put back as the turn's prompt found them, since a turn started by a background
+# notice or another session can write them itself. Only a turn whose own prompt hook kept that copy,
+# for a prompt that began with one of the forms, is skipped (_ot_snap_ours); without it the turn
+# records as before, its notes left as they are.
+if _ot_machine_turn && _ot_snap_ours; then
+  _ot_restore
+  rm -f "$TRACK_DIR/turnstart-$SID.txt" 2>/dev/null
+  exit 0
+fi
+
 # Stamp the working directory before the marker check, not after. The Stop payload
 # carries no cwd, so without this an opted-out session would exit at UserPromptSubmit
 # having recorded nothing, and then Stop would have no cwd to test the marker against
@@ -586,13 +599,9 @@ _sb_stop_kind() {
   fi
   return 0
 }
-# Off unless switched on for the person, until the team rollout. Builtins only, here and below.
-_sb_on() {
-  case "${APROPOS_SENDBACK:-}" in
-    [Oo][Nn]|1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
-  esac
-  return 1
-}
+# Off unless switched on for the person, until the team rollout. Read by the one parser every
+# per-person switch uses (_setting_on, lib/ownturns.sh). Builtins only, here and below.
+_sb_on() { _setting_on "${APROPOS_SENDBACK:-}"; }
 _sb_attended() {
   [[ "${CLAUDE_CODE_SESSION_ATTENDED:-}" == 1 ]] || return 1
   case "${CLAUDE_CODE_ENTRYPOINT:-}" in ''|[Ss][Dd][Kk]*) return 1 ;; esac
@@ -754,6 +763,25 @@ transcript_path() {
 
 # Words that must never reach an invoice-facing field, whatever the source.
 APROPOS_BANNED='claude|anthropic|\bAI\b|assistant|chatbot|copilot'
+
+# Last resort before the placeholder: describe the turn from what the response
+# actually said. The final assistant text block IS this turn's answer, because Stop
+# only fires once the response is complete.
+#
+# Added 2026-08-12. The plugin README has claimed this behaviour since 0.2.0 but no
+# code implemented it, so every turn where the model forgot to write a description
+# booked "[needs description] <project>" instead. On one team machine the working
+# directory is named "Claude", so that placeholder put a literal AI reference on a
+# client-invoice-facing field, repeatedly.
+# Shortest derived description worth putting on a timesheet. Measured against 12 real
+# sessions: below this the candidates are things like "Sent", "Draft below" and
+# "Incident is closed", which say less than an honest placeholder does.
+#
+# Length alone is not enough. A floor of 60 was tried and rejected because it threw
+# out real descriptions ("Rebuilt the template and verified it at five widths.", 52).
+# The bad short candidates are conversational acknowledgements, not short work, so
+# they are matched by shape below instead.
+APROPOS_DERIVE_MIN="${APROPOS_DERIVE_MIN:-40}"
 
 # Punctuation the house style rules ban outright. Normalised rather than refused, and
 # done with bash parameter expansion rather than sed: this runs on every turn, and a
@@ -1005,6 +1033,69 @@ _desc_refuse() {
   esac
   case "$p" in *" claude "*|*" anthropic "*|*" ai "*|*" assistant "*|*" chatbot "*|*" copilot "*|*" agent "*|*" subagent "*) return 0 ;; esac
 
+  return 1
+}
+
+# Clean one candidate sentence, or fail. Shared by both sources below.
+_clean_candidate() {
+  local s
+  s="$(printf '%s' "$1" \
+       | sed -e 's/[*`#|_>]/ /g' \
+             -e 's/\[\([^]]*\)\]([^)]*)/\1/g' \
+             -e 's/^[[:space:]]*[Tt]imestamp:[[:space:]]*//' \
+             -e 's/^[[:space:]]*[0-9-]\{10\}[[:space:]][0-9:]\{5,8\}[[:space:]]*UTC[[:space:]-]*//' \
+             -e 's/^[[:space:]]*[-—–][[:space:]]*//' \
+             -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//')"
+  s="${s%%. *}"; s="${s%.}"
+  (( ${#s} < APROPOS_DERIVE_MIN )) && return 1
+  # Acknowledgements, not work. "Noted, that reads well and the ask is clear" passes a
+  # length floor but describes nothing that happened.
+  printf '%s' "$s" | grep -Eqi '^(noted|sent|done|yes|no|correct|agreed|thanks|thank you|ok|okay|right|sure|understood|good|fair|exactly|indeed|got it|perfect)([^[:alnum:]]|$)' && return 1
+  # The rules ban file paths and script names from an invoice-facing field.
+  printf '%s' "$s" | grep -Eq '[A-Za-z]:\\|\\\\|/[A-Za-z0-9_.-]+/|\.(ps1|sh|js|md|php|sql|json|html|txt|csv|xlsx|jsonl|cmd|bat|py)\b' && return 1
+  printf '%s' "$s" | grep -Eqi "$APROPOS_BANNED" && return 1
+  # The same voice screen the model-written description gets, so neither route bypasses
+  # it. The derived text is the worse offender: it is lifted from a reply.
+  s="$(_desc_normalise "$s")"
+  _desc_refuse "$s" && return 1
+  (( ${#s} > DESC_MAX )) && { s="${s:0:$DESC_MAX}"; s="${s% *}"; }
+  # Sentence case, since a lifted fragment often starts mid-thought.
+  printf '%s.' "$(printf '%s' "${s:0:1}" | tr '[:lower:]' '[:upper:]')${s:1}"
+}
+
+# Last resort before the placeholder: describe the turn from what the response
+# actually said. The final assistant text block IS this turn's answer, because Stop
+# only fires once the response is complete.
+#
+# Two sources, best first: the labelled summary that ends a long reply, then the
+# reply's opening sentence. Measured across 12 real sessions, the summary is present
+# about 60% of the time and is usually a statement of what was done; the opening
+# sentence is the better of the rest. Anything failing the floor or the content rules
+# falls through to the placeholder, which is the honest outcome.
+#
+# Added 2026-08-12. The plugin README has claimed this behaviour since 0.2.0 but no
+# code implemented it, so every turn where the model forgot to write a description
+# booked "[needs description] <project>". On one team machine the working directory
+# is named "Claude", so that put a literal AI reference on an invoice-facing field.
+#
+# Only the live turn uses this, for its own new entry. The repair of an entry already flagged
+# never does (_repair_candidate says why).
+desc_from_transcript() {
+  local f raw out
+  command -v jq >/dev/null 2>&1 || return 1
+  f="$(transcript_path "$SID" "$1")" || return 1
+
+  # One line per text block, newest last. gsub collapses the block so tail -1 gets a
+  # whole block rather than its last physical line.
+  raw="$(tail -n 800 "$f" 2>/dev/null \
+        | jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text | gsub("\\s+"; " ")' 2>/dev/null \
+        | awk 'NF' | tail -n 1)"
+  [[ -n "$raw" ]] || return 1
+
+  case "$raw" in
+    *"Summary:"*) out="$(_clean_candidate "${raw##*Summary:}")" && { printf '%s' "$out"; return 0; } ;;
+  esac
+  out="$(_clean_candidate "$raw")" && { printf '%s' "$out"; return 0; }
   return 1
 }
 
@@ -1709,13 +1800,22 @@ record_turn() {
   local START="$1"
   RT_OUT_K=""; RT_OUT_ID=""; RT_OUT_PREV="-"; RT_OUT_STICKY0="-"
 
-  # Description: the file the session wrote, or a flag. Nothing else, ever: not the prompt, not
-  # the session's replies, not the transcript, not the last reply carried in the Stop input.
-  # Until this change a turn with no description took one from the session's last reply, and
-  # that put private figures from a personal conversation into an entry's description. A flag
-  # is visible and gets corrected; a description lifted from a conversation reads as finished,
-  # and can carry anything the conversation held. Where it is switched on, the session is
-  # asked for its note before the reply ends instead (THE SEND-BACK, above).
+  # Description, best source first. Which sources depends on APROPOS_OWN_TURNS.
+  #
+  # With it off (the default), as in every release up to the one before this setting:
+  #   1. the model-written file, which is the intended path
+  #   2. the last assistant message from the transcript (desc_from_transcript, APROPOS_DERIVE)
+  #   3. a flagged placeholder
+  #
+  # With it on: the file the session wrote, or a flag. Nothing else: not the prompt, not the
+  # session's replies, not the transcript, not the last reply carried in the Stop input. A turn
+  # with no description that took one from the session's last reply once put private figures
+  # from a personal conversation into an entry's description. A flag is visible and gets
+  # corrected; a description lifted from a conversation reads as finished, and can carry anything
+  # the conversation held. Where it is switched on, the session is asked for its note before the
+  # reply ends instead (THE SEND-BACK, above).
+  #
+  # Either way never the raw prompt, which describes the request rather than the work done.
   local DESC=""
   # Whether the screen threw away a description this turn. The recorder has always known
   # this at the moment of refusal and then discarded it before writing the entry, which
@@ -1728,8 +1828,9 @@ record_turn() {
     DESC="$RT_DESC_VAL"; WROTE="$RT_DESC_WROTE"
   elif [[ -s "$descf" ]]; then
     DESC="$(_desc_normalise "$(cat "$descf")")"
-    # Screened before it is used. Refusing it falls through to the flagged placeholder,
-    # which is visible and gets corrected, rather than shipping a reply onto an invoice.
+    # A supplied description is held to the same standard as a derived one. Refusing it
+    # falls through to the transcript (setting off) and then to the flagged placeholder, which
+    # is visible and gets corrected, rather than shipping a reply onto an invoice.
     if _desc_refuse "$DESC"; then
       printf 'apropos: the description written this turn reads as a reply rather than a record of the work, so it was not used. Rewrite it in the past tense, from your own perspective, saying what was accomplished.\n' >&2
       DESC=""
@@ -1742,9 +1843,22 @@ record_turn() {
   fi
   local basecwd="$CWD"
   [[ -z "$basecwd" && -s "$cwdf" ]] && basecwd="$(cat "$cwdf")"
+  # With APROPOS_OWN_TURNS off only, and never for the send-back's second recording, whose
+  # description is already worked out (RT_DESC_SET): the fallback to the last reply, unchanged.
+  # APROPOS_DERIVE=off keeps the old behaviour, for anyone who would rather see an
+  # explicit placeholder to correct than an approximate description that reads as
+  # finished. The derived text is a safety net; the model writing one is the fix.
+  if ! _ot_on && (( ! RT_DESC_SET )); then
+  case "$(printf '%s' "${APROPOS_DERIVE:-on}" | tr '[:upper:]' '[:lower:]')" in
+    off|0|false|no) ;;
+    *) [[ -z "${DESC//[[:space:]]/}" ]] && DESC="$(desc_from_transcript "$basecwd" 2>/dev/null)" ;;
+  esac
+  fi
   if [[ -z "${DESC//[[:space:]]/}" ]]; then
-    # Which flag. Only a description the session actually wrote can be rejected; nothing
-    # written is the other cause.
+    # Which flag. A refused TRANSCRIPT is not a rejection: the transcript is a salvage
+    # attempt, not a description the session wrote, so it stays the never-written cause.
+    # Counting it against the screen would inflate the one number this exists to make
+    # trustworthy. Only a description the session actually wrote can be rejected.
     local ph="$DESC_PH_NONE"
     (( REFUSED )) && ph="$DESC_PH_REJECTED"
     local proj; proj="$(basename "$basecwd" 2>/dev/null)"
@@ -2407,6 +2521,10 @@ case "$EVENT" in
     if [[ -s "$descf" ]]; then
       record_turn "$(start_from_stamp "$startf")"
     fi
+    # With APROPOS_OWN_TURNS on, keep the session's notes as this prompt finds them, so a turn
+    # that turns out to have been started by a background notice or another session can put them
+    # back at its Stop (lib/ownturns.sh). Keyed by the stamp written next.
+    _ot_on && _ot_snap "$NOW"
     # Stamp this turn's start for the Stop hook to use.
     printf '%s' "$NOW" > "$startf"
     [[ -n "$CWD" ]] && printf '%s' "$CWD" > "$cwdf"
