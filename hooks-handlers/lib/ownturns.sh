@@ -7,9 +7,10 @@
 #
 # WHY. For a person whose time with agents is measured separately from the session transcripts,
 # every turn the recorder writes that the person did not start is clutter on their own timecard:
-# background task notices and helper hand-backs, messages from other sessions, the recorder's own
-# send-back, usage-limit notices, and the continuation after a compaction. Measured in one such
-# person's session: about 199 prompts typed against 258 started by something else.
+# background task notices and helper hand-backs, messages from other sessions and their idle
+# notices, the recorder's own send-back, usage-limit notices, and the continuation after a
+# compaction. Measured in one such person's session: about 199 prompts typed against 258 started
+# by something else.
 #
 # WHAT. With APROPOS_OWN_TURNS on, a Stop records nothing, and changes nothing the next turn uses,
 # only when the turn's starting prompt record in the transcript BEGINS with one of a closed list of
@@ -102,7 +103,18 @@ _ot_on() { _setting_on "${APROPOS_OWN_TURNS:-}"; }
 #   "This session is being continued from a previous conversation"   the compaction summary
 #   "The rc-reconnect plugin sent a message:"  a plugin's automatic note (8 turns)
 #   "<agent-message"                 a helper's message, queued into a turn (161, never a start)
-OT_FORMS_JQ='["<task-notification>", "Another Claude session sent a message:", "Stop hook feedback:", "[Usage limit reached", "[Earlier usage-limit notes", "Your claude.ai usage limit has reset", "This session is being continued from a previous conversation", "The rc-reconnect plugin sent a message:", "<agent-message"]'
+#   "<cross-session-message"         a message from another session as the prompt hook is given it,
+#                                    and as it is queued into a running turn: the element alone,
+#                                    without the line the transcript writes before it (queued: seen
+#                                    directly, origin kind "peer"; prompt hook: inferred, the copy of
+#                                    the notes was kept as for a typed prompt in 39 of 39 such turns)
+#   "[Cross-session idle notice]"    another session's notice that it is idle (4 turns, prompt
+#                                    source "system", never typed)
+# A message from another session is one form in two dresses, "Another Claude session sent a
+# message:" and "<cross-session-message", and both are listed so that the turn's starting record,
+# the messages queued into it and the prompt hook's copy of the notes are all read alike, whichever
+# dress each is given.
+OT_FORMS_JQ='["<task-notification>", "Another Claude session sent a message:", "Stop hook feedback:", "[Usage limit reached", "[Earlier usage-limit notes", "Your claude.ai usage limit has reset", "This session is being continued from a previous conversation", "The rc-reconnect plugin sent a message:", "<agent-message", "<cross-session-message", "[Cross-session idle notice]"]'
 
 OT_JQ='
   def ot_forms: '"$OT_FORMS_JQ"';
