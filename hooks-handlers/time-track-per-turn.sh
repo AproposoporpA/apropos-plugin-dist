@@ -114,6 +114,18 @@ case "$(printf '%s' "${APROPOS_SKIP:-}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on) exit 0 ;;
 esac
 
+# ONLY A PERSON'S OWN TURNS, IN SESSIONS THEY ARE PRESENT FOR (lib/ownturns.sh, rules 1 to 3). A
+# session Claude Code does not run as an attended interactive one (claude -p, the SDK, a scheduled
+# run, a background or child session) and a helper agent's event record nothing on the card; agent
+# time measures them from the transcripts. Read before anything else, so such a session opens,
+# recovers and delivers nothing. At its Stop the turn's description is removed and its stamp with it,
+# so that a later prompt in the same session, resumed by a person, does not record it as a turn of
+# its own. The task, worktype and project are left as the session wrote them. Off with the rule.
+if _ot_on && [[ "$EVENT" == Stop || "$EVENT" == UserPromptSubmit ]] && _ot_unattended; then
+  [[ "$EVENT" == Stop ]] && rm -f "$TRACK_DIR/description-$SID.txt" "$TRACK_DIR/turnstart-$SID.txt" 2>/dev/null
+  exit 0
+fi
+
 # AN IDLE CHECK-IN IS NOT WORK.
 #
 # A session that belongs to a working group in the MMRY memory service is woken about every half
@@ -415,15 +427,16 @@ _ci_idle_checkin() {
 }
 if _ci_idle_checkin; then
   rm -f "$TRACK_DIR/turnstart-$SID.txt" 2>/dev/null
+  # The notes as this Stop leaves them, for a next turn whose prompt hook does not run (lib/ownturns.sh).
+  _ot_on && _ot_baseline
   exit 0
 fi
 
-# ONLY THE TURNS THE PERSON STARTS, for a person with APROPOS_OWN_TURNS on (lib/ownturns.sh says
-# what is skipped and why). Skipped the same way as an idle check-in, except that the session's
-# notes are first put back as the turn's prompt found them, since a turn started by a background
-# notice or another session can write them itself. Only a turn whose own prompt hook kept that copy,
-# for a prompt that began with one of the forms, is skipped (_ot_snap_ours); without it the turn
-# records as before, its notes left as they are.
+# ONLY THE TURNS THE PERSON STARTS (lib/ownturns.sh, rule 4, says what is skipped and why). Skipped
+# the same way as an idle check-in, except that the session's notes are first put back as the turn
+# found them, since a turn started by a background notice, another session or a loop can write them
+# itself. Only a turn whose copy of the notes is its own is skipped (_ot_snap_ours); without it the
+# turn records as before, its notes left as they are.
 if _ot_machine_turn && _ot_snap_ours; then
   _ot_restore
   rm -f "$TRACK_DIR/turnstart-$SID.txt" 2>/dev/null
@@ -2496,6 +2509,9 @@ case "$EVENT" in
         fi
       fi
     fi
+    # The notes as this Stop leaves them, for a next turn whose prompt hook does not run: such a turn
+    # that the rule skips is put back to these (lib/ownturns.sh, WHICH COPY IS THE TURN'S OWN).
+    _ot_on && _ot_baseline
     ;;
   Sweep)
     # Once-a-day repair pass across the WHOLE ledger, triggered from session-init.sh's
@@ -2518,13 +2534,20 @@ case "$EVENT" in
     # not run for the previous turn (crash, kill, Stop not registered). Record it
     # with that turn's stamped start so the work is not lost. A hold's notes were removed
     # above (THE SEND-BACK): its Stop recorded it.
-    if [[ -s "$descf" ]]; then
+    #
+    # Except for a notice or a message from another session that arrives, with only your own turns
+    # recorded, while the copy of the notes under the live stamp was kept for one too: it is queued
+    # into a machine turn, or follows one whose Stop did not run, and the leftover notes are that
+    # machine turn's. It records nothing, and keeps that copy under the new stamp (_ot_keep_copy).
+    _ot_kept=0
+    _ot_on && _ot_keep_copy "$NOW" && _ot_kept=1
+    if (( ! _ot_kept )) && [[ -s "$descf" ]]; then
       record_turn "$(start_from_stamp "$startf")"
     fi
     # With APROPOS_OWN_TURNS on, keep the session's notes as this prompt finds them, so a turn
     # that turns out to have been started by a background notice or another session can put them
     # back at its Stop (lib/ownturns.sh). Keyed by the stamp written next.
-    _ot_on && _ot_snap "$NOW"
+    (( _ot_kept )) || { _ot_on && _ot_snap "$NOW"; }
     # Stamp this turn's start for the Stop hook to use.
     printf '%s' "$NOW" > "$startf"
     [[ -n "$CWD" ]] && printf '%s' "$CWD" > "$cwdf"

@@ -6,13 +6,15 @@ Time entries are START MARKERS only — the start of a new activity ends the pri
 
 This replaced one-entry-per-turn on 2026-08-13, after four days produced over three hundred entries, 185 of them under five minutes and 20 of zero length.
 
-**Writing a specific description each turn is REQUIRED, not optional.** If you don't, the hook may fall back to your last reply in the session transcript, which refuses conversational acknowledgements, anything carrying a file path and anything naming the tooling, so it often lands on a flagged placeholder instead; for some people the fallback is off and the entry is always flagged. Either way the user then has to find and fix it. That is a failure on your part. Always write a concrete description of what was actually done.
+**Writing a specific description each turn is REQUIRED, not optional.** If you don't, the entry is flagged: nothing is taken from your replies unless the person has turned that rule off, and even then the fallback to your last reply refuses conversational acknowledgements, anything carrying a file path and anything naming the tooling, so it often lands on a flagged placeholder anyway. Either way the user then has to find and fix it. That is a failure on your part. Always write a concrete description of what was actually done.
 
 For some people the hook asks for the notes when a reply ends without them: once per turn for the description, and at most once per session for the task. When it asks, write the files it names in one shell command, then close with one short sentence. If the work has no task, write `none` to the task file, and you will not be asked about the task again in this session.
 
 The flag says which of you got it wrong. `[needs description]` means no description was written at all. `[rewrite description]` means one was written and the screen judged it unfit for a customer invoice, so the rewrite is on you and the message on the error stream says what to change.
 
 If this session started with `APROPOS ALERT: time is not recording in Apropos for the login ...`, tell the user once, plainly, in your first response: their time is being kept on this computer but not yet recorded, and why, as the alert says. Keep writing the files below as usual; the held turns keep their descriptions and are delivered once the login is identified.
+
+If this session started with `APROPOS: this session is running version ... of the time recording plugin, but version ... is installed`, tell the user once, plainly, in your first response: which version runs, which is installed, and that /reload-plugins or a restart fixes it.
 
 If this session started with `APROPOS ALERT: ... flagged time entr...` or `APROPOS: ... left unrepaired by the daily pass`, tell the user once, plainly, in your first response: how many entries, the flag texts to search for in Apropos, and what the line says to do. Never quote or guess at what those entries were.
 

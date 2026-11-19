@@ -116,6 +116,15 @@ if [[ -n "$PERSON_ALERT_CAUSE" ]]; then
   fi
 fi
 
+# Which plugin version runs here, and which is installed (lib/registry.sh). Local reads only, so it
+# is told now; the session passes it on to the person once (convention.md).
+SI_REG=0
+if [[ -n "$P" && -f "$P/hooks-handlers/lib/registry.sh" ]] && source "$P/hooks-handlers/lib/registry.sh"; then
+  SI_REG=1
+  reg_versions "$P"
+  reg_version_notice "${CLAUDE_CODE_SESSION_ID:-}"
+fi
+
 # 4. The slow work, silent and bounded: deliver what earlier sessions left queued, then launch
 # the once-a-day repair pass in the background.
 #
@@ -150,6 +159,24 @@ if (( HAVE_LIBS )) && (( left > SI_DELIVERY )); then
   si_bounded "$left" bash -c 'source "$1/hooks-handlers/lib/queue.sh"; source "$1/hooks-handlers/lib/writer.sh"; source "$1/hooks-handlers/lib/person.sh"; q_flush "$2" write_entry' _ "$P" "$QUEUE" >/dev/null 2>&1 </dev/null || true
 fi
 unset APROPOS_FLUSH_DEADLINE APROPOS_SWEEP_DEADLINE
+# This computer's line in the team's machine registry (lib/registry.sh): in the background, under its
+# own hard limit where a coreutils timeout exists, so a slow share never holds this hook. It writes at
+# most once a day, and again only when something it reports has changed. APROPOS_REGISTRY_WAIT=1 (a
+# test hook) waits for it.
+if (( SI_REG )); then
+  si_rlogin="$PERSON_ALERT_LOGIN"; [[ -n "$si_rlogin" ]] || si_rlogin="$( { declare -F apropos_login >/dev/null && apropos_login; } 2>/dev/null)"
+  si_rpid=""; [[ -z "$PERSON_ALERT_CAUSE" ]] && si_rpid="${PERSON_ID:-}"
+  si_rcmd='source "$1/hooks-handlers/lib/registry.sh"; reg_versions "$1"; reg_write "$2" "$3"'
+  if [[ "${APROPOS_REGISTRY_WAIT:-}" == 1 ]]; then
+    bash -c "$si_rcmd" _ "$P" "$si_rlogin" "$si_rpid" </dev/null >/dev/null 2>&1
+  else
+    (
+      if [[ -n "$SI_TO" ]]; then "$SI_TO" -k "$SI_KILL_GRACE" 20 bash -c "$si_rcmd" _ "$P" "$si_rlogin" "$si_rpid"
+      else bash -c "$si_rcmd" _ "$P" "$si_rlogin" "$si_rpid"; fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+fi
 if (( HAVE_LIBS )) && declare -F sweep_due >/dev/null && [[ -f "$P/hooks-handlers/time-track-per-turn.sh" ]]; then
   si_launched=0
   if ! sweep_due; then
