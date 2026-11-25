@@ -36,14 +36,68 @@ Q_MAX_ATTEMPTS="${Q_MAX_ATTEMPTS:-5}"
 
 _q_now() { date -u +%s; }
 
+# EVERY LOCK NAMES ITS HOLDER (0.2.19). Claude Code stops a hook at its time limit, and a hook
+# stopped while it held a lock left the lock behind. Every later flush on the computer then
+# skipped for Q_LOCK_STALE_SECS (120 s), and every open-entry write retried 50 times before giving
+# up, which pushed those hooks over the limit as well: one stopped run made the next one likelier.
+# Measured 2026-11-23 on a busy computer, about one run in three. And the first flush after the
+# 120 s broke the lock and sent the entry the stopped run had already saved, a second time.
+#
+# So the process that takes a lock writes its id into it (<lock>/pid), and a lock whose holder is
+# no longer running is taken over at once. kill -0 is a builtin and starts no process. A holder
+# that is still running keeps the age limit as before, which also covers a process id the system
+# has given to a new process since. A lock written by an older version has no pid file and is
+# judged by its age, exactly as before.
+#
+# Taking over is done under a second, short lock (<lock>.break), and only after reading the lock
+# again under it: several sessions often meet one abandoned lock at the same moment, and without
+# that each could remove the lock another had just taken over.
+#
+# Whose id: the process actually running this code (BASHPID; $$ is the parent's inside a
+# subshell), because that is the process that will release it.
+# _q_token <lock dir> - sets _q_tok, which the caller declares local, to "pid/ts" as the holder
+# wrote them. Builtins only: on a busy Windows computer every process started costs a few hundred
+# milliseconds of the hook's 30 seconds, and a subshell costs as much.
+_q_token() {
+  local p="" t=""
+  [[ -f "$1/pid" ]] && IFS= read -r p < "$1/pid" 2>/dev/null
+  [[ -f "$1/ts" ]] && IFS= read -r t < "$1/ts" 2>/dev/null
+  _q_tok="$p/$t"
+}
+_q_stamp() { printf '%s\n' "$2" > "$1/pid" 2>/dev/null; _q_now > "$1/ts" 2>/dev/null; }
+# _q_take_over <lock dir> <token judged abandoned> <my id> - 0 when this process now holds the lock.
+_q_take_over() {
+  local lock="$1" was="$2" me="$3" bk="$1.break" bt _q_tok="" got=1
+  if ! mkdir "$bk" 2>/dev/null; then
+    # Another process is taking it over, or died doing so: a break lock older than 10 s is left over.
+    bt="$(stat -c %Y "$bk" 2>/dev/null)"
+    [[ "$bt" =~ ^[0-9]+$ ]] && (( $(_q_now) - bt > 10 )) || return 1
+    rm -rf "$bk" 2>/dev/null; mkdir "$bk" 2>/dev/null || return 1
+  fi
+  _q_token "$lock"
+  if [[ "$_q_tok" == "$was" ]]; then
+    rm -rf "$lock" 2>/dev/null || true
+    if mkdir "$lock" 2>/dev/null; then _q_stamp "$lock" "$me"; got=0; fi
+  elif mkdir "$lock" 2>/dev/null; then
+    # Released while we looked: an ordinary take.
+    _q_stamp "$lock" "$me"; got=0
+  fi
+  rmdir "$bk" 2>/dev/null || rm -rf "$bk" 2>/dev/null
+  return $got
+}
+
 # Acquire the queue mutex. Returns 0 on success, 1 if another process holds it.
-# A lock older than Q_LOCK_STALE_SECS is treated as abandoned and broken, so a process
-# killed mid-flush cannot wedge time recording permanently.
+# A lock whose holder has gone is taken over at once (above); one older than Q_LOCK_STALE_SECS is
+# treated as abandoned and broken, so a process killed mid-flush cannot wedge time recording.
 q_lock() {
-  local qf="$1" lock="$1.lock" age start
-  mkdir -p "$(dirname "$qf")" 2>/dev/null || true
-  if mkdir "$lock" 2>/dev/null; then _q_now > "$lock/ts" 2>/dev/null; return 0; fi
-  start="$(cat "$lock/ts" 2>/dev/null)"
+  local qf="$1" lock="$1.lock" age start me="${BASHPID:-$$}" owner _q_tok="" d="${1%/*}"
+  [[ "$d" != "$qf" && -n "$d" && ! -d "$d" ]] && mkdir -p "$d" 2>/dev/null
+  if mkdir "$lock" 2>/dev/null; then _q_stamp "$lock" "$me"; return 0; fi
+  _q_token "$lock"; owner="${_q_tok%%/*}"
+  if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+    _q_take_over "$lock" "$_q_tok" "$me"; return $?
+  fi
+  start="${_q_tok#*/}"
   if ! [[ "$start" =~ ^[0-9]+$ ]]; then
     # No usable timestamp yet. Taking the lock is two steps, mkdir then the stamp, so a
     # holder that has just succeeded at mkdir has an unstamped lock for a moment. Treating
@@ -60,14 +114,21 @@ q_lock() {
   if [[ "$start" =~ ^[0-9]+$ ]]; then
     age=$(( $(_q_now) - start ))
     if (( age > Q_LOCK_STALE_SECS )); then
-      rm -rf "$lock" 2>/dev/null || true
-      if mkdir "$lock" 2>/dev/null; then _q_now > "$lock/ts" 2>/dev/null; return 0; fi
+      _q_take_over "$lock" "$_q_tok" "$me"; return $?
     fi
   fi
   return 1
 }
 
-q_unlock() { rm -rf "$1.lock" 2>/dev/null || true; }
+# Release a lock this process holds. A lock that names another holder is left alone: this process
+# was held up long enough for the lock to be taken over, and removing it now would let two flushes
+# run at once. A lock with no holder named (an older version's) is removed as before.
+q_unlock() {
+  local owner=""
+  [[ -f "$1.lock/pid" ]] && IFS= read -r owner < "$1.lock/pid" 2>/dev/null
+  [[ -n "$owner" && "$owner" != "${BASHPID:-$$}" ]] && return 0
+  rm -rf "$1.lock" 2>/dev/null || true
+}
 
 q_enqueue() {
   local qf="$1" person="$2" desc="$3" wt="$4" task="$5" proj="$6" start="$7"
@@ -180,6 +241,11 @@ q_quarantine_stale() {
 # What a flush callback returns for an entry that must stay queued without counting as a
 # failed delivery: its person is not identified yet. write_entry in lib/writer.sh returns it.
 Q_RC_DEFER=75
+# What a flush callback returns when the delivery was cut off because the run's time was up
+# (0.2.19): the line stays exactly as it was, attempts unchanged, and the flush stops there. With
+# the save-once script a cut delivery is harmless, because sending it again returns the row it may
+# already have written, so a slow computer never parks an entry in .dead for being slow.
+Q_RC_LATE=76
 
 # _q_merge_retry <queuefile> [<deadline epoch>]: fold a side file left by an earlier flush back
 # into the queue. Returns 0 once it is fully merged (or there is none), 1 if the deadline came
@@ -243,6 +309,25 @@ _q_merge_retry() {
   return 0
 }
 
+# _q_sweep_leftovers <queuefile> - remove the working files a stopped run left behind. Each carries
+# the id of the process that wrote it (".tmp.<pid>" and the like), and one whose process is gone is
+# never moved into place by anybody. 2026-11-23 on one computer: 29 open-entry and 44 queue working
+# files, one for each run stopped mid-write since October. Builtins only, except one rm per file
+# found; a file whose process still runs is left alone.
+_q_sweep_leftovers() {
+  local _ql_f _ql_p _ql_g=("$1".tags.* "$1".stalenew.* "$1".merge.* "$1".retry.tmp.*)
+  [[ -n "${APROPOS_OPEN_FILE:-}" ]] && _ql_g+=("$APROPOS_OPEN_FILE".tmp.*)
+  [[ -n "${APROPOS_ENTRY_IDS_FILE:-}" ]] && _ql_g+=("$APROPOS_ENTRY_IDS_FILE".tmp.*)
+  for _ql_f in "${_ql_g[@]}"; do
+    [[ -e "$_ql_f" ]] || continue
+    _ql_p="${_ql_f##*.}"
+    [[ "$_ql_p" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$_ql_p" 2>/dev/null && continue
+    rm -f "$_ql_f" 2>/dev/null
+  done
+  return 0
+}
+
 # q_flush <queuefile> <callback>
 #
 # APROPOS_FLUSH_DEADLINE, optional, is an epoch second after which no further delivery is
@@ -261,6 +346,7 @@ q_flush() {
   # Only one flush at a time. If another holds the lock, do nothing; the next turn
   # flushes. Skipping is always safe because the queue is durable.
   q_lock "$_qf_qf" || return 0
+  _q_sweep_leftovers "$_qf_qf"
   local _qf_deadline="${APROPOS_FLUSH_DEADLINE:-}"
   [[ "$_qf_deadline" =~ ^[0-9]+$ ]] || _qf_deadline=""
   # Nothing is delivered while a side file from an earlier version is still being merged: a
@@ -318,6 +404,9 @@ q_flush() {
       # that simply has not been set up yet.
       _qf_deferred="$_qf_deferred$_qf_person "
       _qf_i=$((_qf_i+1))
+    elif (( _qf_rc == Q_RC_LATE )); then
+      # Out of time: left exactly as it was, and nothing more is started (Q_RC_LATE above).
+      _qf_late=1; break
     else
       _qf_attempts=$((_qf_attempts+1))
       if (( _qf_attempts >= Q_MAX_ATTEMPTS )); then

@@ -71,6 +71,24 @@ source "$HERE/lib/ledger.sh"
 source "$HERE/lib/catchall.sh"
 source "$HERE/lib/ownturns.sh"
 
+# THE RUN'S OWN TIME (0.2.19). Claude Code stops this hook APROPOS_HOOK_LIMIT_SECS after starting it
+# (hooks/hooks.json: 30). A run stopped there while a write was under way left the entry queued after
+# it had been saved, and its locks behind: on 2026-11-23 about one run in three on a busy computer,
+# and the source of every same-start duplicate on the timecards. So the writes this run makes are
+# started only when they can finish inside that limit, and are cut off at it where a coreutils
+# timeout exists. $SECONDS counts from this shell's start, a little after Claude Code's own clock;
+# APROPOS_HOOK_RESERVE_SECS (4) covers that and the steps after the flush. A write is cut off 3 seconds
+# before that end, so the open-entry step and the queue commit after it still fit.
+APROPOS_HOOK_LIMIT_SECS="${APROPOS_HOOK_LIMIT_SECS:-30}"
+[[ "$APROPOS_HOOK_LIMIT_SECS" =~ ^[0-9]{1,5}$ ]] && APROPOS_HOOK_LIMIT_SECS=$(( 10#$APROPOS_HOOK_LIMIT_SECS )) || APROPOS_HOOK_LIMIT_SECS=30
+APROPOS_HOOK_RESERVE_SECS="${APROPOS_HOOK_RESERVE_SECS:-4}"
+[[ "$APROPOS_HOOK_RESERVE_SECS" =~ ^[0-9]{1,5}$ ]] && APROPOS_HOOK_RESERVE_SECS=$(( 10#$APROPOS_HOOK_RESERVE_SECS )) || APROPOS_HOOK_RESERVE_SECS=4
+# _hook_left - sets HOOK_LEFT to the seconds this run may still spend. Builtins only.
+_hook_left() { HOOK_LEFT=$(( APROPOS_HOOK_LIMIT_SECS - APROPOS_HOOK_RESERVE_SECS - SECONDS )); }
+# _hook_timeout - sets HOOK_TO to a coreutils timeout, or nothing; looked up once per run.
+HOOK_TO=""; _HOOK_TO_DONE=0
+_hook_timeout() { (( _HOOK_TO_DONE )) || { HOOK_TO="$(apropos_timeout_exe 2>/dev/null)"; _HOOK_TO_DONE=1; }; }
+
 TRACK_DIR="${APROPOS_TRACK_DIR:-/tmp/claude-timetrack}"
 QUEUE="${HOME}/.claude/apropos-time/pending.tsv"
 mkdir -p "$TRACK_DIR" "${HOME}/.claude/apropos-time" 2>/dev/null || true
@@ -2053,7 +2071,12 @@ record_turn() {
                 printf 'apropos: the open-entry record for this activity is unreadable, so the entry was recorded separately rather than risk overwriting a correction.\n' >&2
               fi
             fi
-            if (( amend_ok )) && amend_entry "$id" "$PERSON" "$DESC" "$expect"; then
+            # Inside the run's time (THE RUN'S OWN TIME): with under 2 s left the turn is queued as its
+            # own entry instead, and otherwise the amend is cut off at the limit where a timeout exists.
+            # Either way the turn is recorded; at worst as an entry of its own beside the open one.
+            _hook_left; _hook_timeout
+            (( HOOK_LEFT < 2 )) && amend_ok=0
+            if (( amend_ok )) && APROPOS_AMEND_TIMEOUT="$HOOK_LEFT" APROPOS_WRITE_TIMEOUT="$HOOK_TO" amend_entry "$id" "$PERSON" "$DESC" "$expect"; then
               MERGED=1; RT_OUT_ID="$id"; RT_OUT_PREV="${expect_b64:--}"
               # The row now holds this turn's description, so that is what the next amend must
               # expect. Left at the insert's text, every amend after the second was refused as
@@ -2118,9 +2141,20 @@ record_turn() {
     if [[ "$lt" =~ ^[0-9]+$ && "$lk" == "$SEG" && $((NOW - lt)) -lt 900 ]]; then DEDUP=1; fi
   fi
 
+  # THE NOTES ARE USED UP THE MOMENT THE TURN IS SETTLED (0.2.19). The turn is now amended into the
+  # open entry, absorbed, or a true duplicate, or it is queued just below; from then on its notes
+  # (the description and worktype files) must be gone, because a leftover description is how the next
+  # prompt knows a Stop did not record its turn, and it records that turn again. They used to be
+  # removed at the very end of this function, after the flag ledger, the day's tally and the shared
+  # task map, which can wait on a lock: a Stop stopped in between left the turn queued AND its notes
+  # in place, and the next prompt recorded the same turn a second time from the same start. So each
+  # path removes them as soon as it is settled: here for the first three, straight after the
+  # enqueue for an insert.
+  if [[ $MERGED -ne 0 || $DEDUP -ne 0 ]]; then rm -f "$descf" "$wtf" 2>/dev/null || true; fi
   if [[ $MERGED -eq 0 && $DEDUP -eq 0 ]]; then
     if [[ -n "$PERSON" ]]; then
       q_enqueue "$QUEUE" "$PERSON" "$DESC" "$WT" "$TASK" "$PROJ" "$START"
+      rm -f "$descf" "$wtf" 2>/dev/null || true
       RT_OUT_K=insert
     else
       RT_OUT_K=unresolved
@@ -2128,6 +2162,7 @@ record_turn() {
       # a person. Said on this turn, plainly, because a silent miss is how a person used to
       # lose days of time without knowing.
       q_enqueue "$QUEUE" "${APROPOS_UNRESOLVED_PREFIX}${LOGIN}" "$DESC" "$WT" "$TASK" "$PROJ" "$START"
+      rm -f "$descf" "$wtf" 2>/dev/null || true
       # Shown to the person through the hook's systemMessage, and kept on stderr for the debug log.
       # Which turn is set once, above the merge, from the event that is recording it.
       local _held_msg
@@ -2214,8 +2249,7 @@ record_turn() {
   # for the next session but can never cost the time itself.
   [[ "$WTSRC" != "default" ]] && task_wt_record "$TASK" "$WT"
 
-  # The turn's notes are used up.
-  rm -f "$descf" "$wtf" 2>/dev/null || true
+  # The turn's notes were used up as soon as the turn was settled (THE NOTES ARE USED UP, above).
 
   # This session's earlier flags are revisited once the hook has done everything else (the end
   # of this file). Needs the person, since every repair is scoped to one person's rows. The
@@ -2589,12 +2623,29 @@ exec 3>&-
 # and on a computer where that was every turn nothing would ever be delivered by a turn. A
 # deadline set by the caller (session start runs the daily pass through this file) wins when it
 # is sooner. Lines not reached stay queued.
+#
+# AND NEVER A DELIVERY THAT CANNOT FINISH (0.2.19). The "first delivery is always attempted" rule
+# above started a 12 to 20 second write in hooks that had already spent 8 to 18 seconds of their 30
+# on a busy computer, and Claude Code stopped about one run in three mid-write: the entry was saved,
+# still queued, and sent again two minutes later. Now a delivery starts only while the run has
+# APROPOS_WRITE_NEED seconds left (how long writes take on this computer, apropos_write_need in
+# lib/writer.sh), and each is cut off at the run's limit where a coreutils timeout exists. What is
+# not started stays queued for the next run, session start included, exactly as lines past the
+# 15 seconds always have.
 _tf_secs="${APROPOS_TURN_FLUSH_SECS:-15}"; [[ "$_tf_secs" =~ ^[0-9]+$ ]] || _tf_secs=15
-_tf_deadline=$(( $(date -u +%s) + _tf_secs ))
+_tf_now="$(date -u +%s)"
+_tf_deadline=$(( _tf_now + _tf_secs ))
+apropos_write_need; _hook_left; _hook_timeout
+_tf_end=$(( _tf_now + HOOK_LEFT ))
+(( _tf_end - APROPOS_WRITE_NEED < _tf_deadline )) && _tf_deadline=$(( _tf_end - APROPOS_WRITE_NEED ))
 if [[ "${APROPOS_FLUSH_DEADLINE:-}" =~ ^[0-9]+$ ]] && (( APROPOS_FLUSH_DEADLINE < _tf_deadline )); then
   _tf_deadline="$APROPOS_FLUSH_DEADLINE"
 fi
-APROPOS_FLUSH_DEADLINE="$_tf_deadline" q_flush "$QUEUE" write_entry
+# With no delivery able to start, the flush is not entered at all: its housekeeping would only
+# spend the time this run does not have.
+if (( _tf_deadline > _tf_now )); then
+  APROPOS_FLUSH_DEADLINE="$_tf_deadline" APROPOS_WRITE_END=$(( _tf_end - 3 )) APROPOS_WRITE_TIMEOUT="$HOOK_TO" q_flush "$QUEUE" write_entry
+fi
 
 # The held reply's own entry was still waiting to be delivered when its notes came (THE SEND-BACK):
 # they are applied now the delivery has run. If it is still not delivered, an accepted description

@@ -114,6 +114,20 @@ APROPOS_CLAIM_WAIT_SECS="${APROPOS_CLAIM_WAIT_SECS:-25}"
 OE_CLAIM_KEY=""
 OE_CLAIM_TS=""
 
+# A CLAIM NAMES ITS PROCESS (0.2.19). A claim is "pending:<process id>". One whose process has
+# gone is treated as abandoned at once, as an expired one always was: before, a hook stopped
+# between claiming and recording left a claim that made every session's next turn on that work wait
+# the full APROPOS_CLAIM_WAIT_SECS (25 s) for an id that was never coming, for up to two minutes,
+# and those waits pushed the next hooks over the time limit too. A claim written by an older version
+# names its process the same way. kill -0 is a builtin.
+#
+# _oe_claim_gone <claim id field> - true when the field is a claim whose process is not running.
+_oe_claim_gone() {
+  local p="${1#pending:}"
+  [[ "$1" == pending:* && "$p" =~ ^[0-9]+$ ]] || return 1
+  ! kill -0 "$p" 2>/dev/null
+}
+
 oe_claim() {
   local key="$1" now k i e b found=0 tmp
   _oe_lock || return 1
@@ -126,9 +140,10 @@ oe_claim() {
       if [[ "$i" =~ ^[0-9]+$ ]]; then
         (( now - e <= APROPOS_MERGE_MAX_SECS )) && found=1
       else
-        # Somebody else's claim, still fresh. A stale one is fair game, so a session that
-        # died mid-insert cannot block the activity forever.
-        (( now - e <= APROPOS_CLAIM_MAX_SECS )) && found=1
+        # Somebody else's claim, still fresh and its process still running. A stale one, or one
+        # whose process has gone, is fair game, so a session that died mid-insert cannot block
+        # the activity.
+        (( now - e <= APROPOS_CLAIM_MAX_SECS )) && ! _oe_claim_gone "$i" && found=1
       fi
     done < "$APROPOS_OPEN_FILE"
   fi
@@ -143,7 +158,7 @@ oe_claim() {
         printf '%s\t%s\t%s\t%s\n' "$k" "$i" "$e" "$b"
       done < "$APROPOS_OPEN_FILE"
     fi
-    printf '%s\tpending:%s\t%s\t\n' "$key" "$$" "$now"
+    printf '%s\tpending:%s\t%s\t\n' "$key" "${BASHPID:-$$}" "$now"
   } > "$tmp" 2>/dev/null && mv "$tmp" "$APROPOS_OPEN_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null || true
   _oe_unlock
@@ -154,11 +169,22 @@ oe_claim() {
 # oe_await <activityKey> -> prints "id epoch descb64" once another session's claim turns
 # into a real entry. Returns 1 if it does not resolve, and the caller then records its own
 # entry rather than losing the turn.
+#
+# Stops waiting at once when the claim's process has gone (A CLAIM NAMES ITS PROCESS, above): no
+# id is coming, and the caller records its own entry, as it did after the full wait.
 oe_await() {
-  local key="$1" out deadline
+  local key="$1" out deadline k i e b gone
   deadline=$(( $(date -u +%s) + APROPOS_CLAIM_WAIT_SECS ))
   while (( $(date -u +%s) < deadline )); do
     if out="$(oe_lookup "$key")"; then printf '%s' "$out"; return 0; fi
+    gone=1
+    if [[ -s "$APROPOS_OPEN_FILE" ]]; then
+      while IFS=$'\t' read -r k i e b; do
+        [[ "$k" == "$key" && "$i" == pending:* ]] || continue
+        _oe_claim_gone "$i" || gone=0
+      done < "$APROPOS_OPEN_FILE"
+    fi
+    (( gone )) && return 1
     sleep 0.25
   done
   return 1
@@ -167,7 +193,7 @@ oe_await() {
 # oe_record <activityKey> <entryId>  — remember this entry as the open one for the
 # activity, and drop any line that has aged out so the file cannot grow without bound.
 oe_record() {
-  local key="$1" id="$2" descb64="${3:-}" now tmp k i e b
+  local key="$1" id="$2" descb64="${3:-}" now
   [[ "$id" =~ ^[0-9]+$ ]] || return 0
   # This one is a read-modify-write and MUST be exclusive. Failing to get the lock means
   # not recording the entry as open, so the next turn inserts instead of amending. That
@@ -188,8 +214,16 @@ oe_record() {
       if (( se > OE_CLAIM_TS )); then _oe_unlock; return 0; fi
     done < "$APROPOS_OPEN_FILE"
   fi
+  _oe_put "$key" "$id" "$now" "$descb64"
+  _oe_unlock
+}
+
+# _oe_put <key> <id> <now> <descb64> - under _oe_lock: the file with the key's line replaced by this
+# one and aged-out lines dropped, written aside and moved into place.
+_oe_put() {
+  local key="$1" id="$2" now="$3" descb64="$4" tmp k i e b
   mkdir -p "$(dirname "$APROPOS_OPEN_FILE")" 2>/dev/null || true
-  tmp="$APROPOS_OPEN_FILE.tmp.$$"
+  tmp="$APROPOS_OPEN_FILE.tmp.${BASHPID:-$$}"
   {
     if [[ -s "$APROPOS_OPEN_FILE" ]]; then
       while IFS=$'\t' read -r k i e b; do
@@ -202,7 +236,35 @@ oe_record() {
     printf '%s\t%s\t%s\t%s\n' "$key" "$id" "$now" "$descb64"
   } > "$tmp" 2>/dev/null && mv "$tmp" "$APROPOS_OPEN_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null || true
+}
+
+# oe_record_existing <activityKey> <entryId> <descb64> - the insert found the entry already
+# recorded (APROPOS_ENTRY_EXISTED, 0.2.19): this is a resend of a delivery whose run was stopped
+# before it noted the entry as sent. Whatever the record already holds for the activity is newer
+# than this resend and is kept: an id with the description a later turn amended it to (the older
+# description must never come back, 363730/363731 on 2026-11-23), or a claim by a session that is
+# still opening its own entry. Only when the activity has nothing, or a claim whose process has
+# gone, is this entry recorded as the open one, with the description it was sent with, which is
+# what the row holds unless somebody has corrected it since; the amend guard then refuses to write
+# over that correction.
+oe_record_existing() {
+  local key="$1" id="$2" descb64="${3:-}" now k i e b keep=0
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  _oe_lock || return 0
+  now="$(date -u +%s)"
+  if [[ -s "$APROPOS_OPEN_FILE" ]]; then
+    while IFS=$'\t' read -r k i e b; do
+      [[ "$k" == "$key" && "$e" =~ ^[0-9]+$ ]] || continue
+      if [[ "$i" =~ ^[0-9]+$ ]]; then
+        (( now - e <= APROPOS_MERGE_MAX_SECS )) && keep=1
+      else
+        (( now - e <= APROPOS_CLAIM_MAX_SECS )) && ! _oe_claim_gone "$i" && keep=1
+      fi
+    done < "$APROPOS_OPEN_FILE"
+  fi
+  (( keep )) || _oe_put "$key" "$id" "$now" "$descb64"
   _oe_unlock
+  return 0
 }
 
 # oe_update_desc <activityKey> <entryId> <descb64> - after an ACCEPTED amend, make the record's
@@ -246,15 +308,22 @@ amend_entry() {
   local script="${APROPOS_SKILL_DIR:-R:/Intranet/ClaudeAI/skills/work-management/time}/Update-TimeDescription.ps1"
   [[ -f "$script" ]] || return 1
   local ps; ps="$(apropos_ps_exe)" || return 1
+  # APROPOS_AMEND_TIMEOUT=<seconds> and APROPOS_WRITE_TIMEOUT=<coreutils timeout>, set by the turn
+  # for this one call (0.2.19), cut the call off there (124), so the run ends inside its time limit.
+  # Every caller treats a non-zero return as "not amended" and records the turn as its own entry.
+  local -a cut=()
+  if [[ "${APROPOS_AMEND_TIMEOUT:-}" =~ ^[0-9]+$ ]] && (( APROPOS_AMEND_TIMEOUT > 0 )) && [[ -n "${APROPOS_WRITE_TIMEOUT:-}" ]]; then
+    cut=("$APROPOS_WRITE_TIMEOUT" "$APROPOS_AMEND_TIMEOUT")
+  fi
   # -ExpectDescription makes the writer refuse the amend when the row no longer holds
   # what this recorder last wrote, which means somebody corrected it. Returning non-zero
   # sends the caller down the insert path, so the continuing work is still recorded.
   # Omitted when there is nothing to compare, so an older writer still works.
   if [[ -n "$expect" ]]; then
-    "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+    "${cut[@]}" "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
       -TimeEntryID "$id" -Description "$desc" -PersonID "$person" -ExpectDescription "$expect" >/dev/null 2>&1
   else
-    "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
+    "${cut[@]}" "$ps" -NoProfile -ExecutionPolicy Bypass -File "$script" \
       -TimeEntryID "$id" -Description "$desc" -PersonID "$person" >/dev/null 2>&1
   fi
 }
@@ -374,25 +443,85 @@ write_entry() {
   local args=(-PersonID "$person" -Description "$desc" -WorkTypeID "$wt" -StartTimeUTC "$start")
   if [[ -n "$task" && "$task" != "0" ]]; then args+=(-TaskID "$task")
   elif [[ -n "$proj" && "$proj" != "0" ]]; then args+=(-ProjectID "$proj"); fi
-  local out rc
-  out="$("$ps" -NoProfile -ExecutionPolicy Bypass -File "$entry" "${args[@]}" 2>/dev/null)"
+  # WITHIN THE RUN'S TIME (0.2.19). The run that delivers sets APROPOS_WRITE_END, the epoch second
+  # by which it must be finished, and APROPOS_WRITE_TIMEOUT, a coreutils timeout. The write is cut
+  # off there and the line stays queued as it was (Q_RC_LATE), instead of the whole run being
+  # stopped by Claude Code mid-write with its locks held. Sending it again is harmless with the
+  # save-once script, which returns the row a cut-off write may already have saved; with an older
+  # script a cut-off write is no worse than the stopped run it replaces. Unset, nothing is cut.
+  local out rc now="" left="" t0=$SECONDS
+  local -a cut=()
+  if [[ "${APROPOS_WRITE_END:-}" =~ ^[0-9]+$ && -n "${APROPOS_WRITE_TIMEOUT:-}" ]]; then
+    printf -v now '%(%s)T' -1 2>/dev/null; [[ "$now" =~ ^[0-9]+$ ]] || now="$(date -u +%s)"
+    left=$(( APROPOS_WRITE_END - now ))
+    (( left < 1 )) && return "${Q_RC_LATE:-76}"
+    cut=("$APROPOS_WRITE_TIMEOUT" "$left")
+  fi
+  out="$("${cut[@]}" "$ps" -NoProfile -ExecutionPolicy Bypass -File "$entry" "${args[@]}" 2>/dev/null)"
   rc=$?
+  # A write that failed or was cut off is noted now; one that succeeded once the open-entry step after
+  # it is done too, since that step also has to fit in the run (apropos_write_need).
+  (( rc != 0 )) && apropos_write_note $(( SECONDS - t0 ))
+  (( ${#cut[@]} )) && (( rc == 124 || rc == 137 )) && return "${Q_RC_LATE:-76}"
   (( rc != 0 )) && return $rc
   # With the send-back on, every row's id is kept by its person and start, a task or not, so the
   # Stop after a held reply's extra step can change the very row its first Stop wrote (ei_record).
   # One appended line: this runs inside a delivery, before the queue drops the line delivered, so it
   # must cost next to nothing. With the setting off nothing here differs from before.
-  local newId="" keep=0
+  local newId="" keep=0 existed=0
   case "${APROPOS_SENDBACK:-}" in [Oo][Nn]|1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) keep=1 ;; esac
-  if (( keep )) || [[ -n "$task" && "$task" != "0" ]]; then
-    newId="$(printf '%s' "$out" | grep -o 'APROPOS_ENTRY_ID=[0-9]*' | head -1 | cut -d= -f2)"
-  fi
+  # Read with bash's own matching: no process started inside a delivery.
+  [[ "$out" =~ APROPOS_ENTRY_ID=([0-9]+) ]] && newId="${BASH_REMATCH[1]}"
+  # The save-once script (0.2.19) says when the entry was already recorded and nothing was added.
+  [[ "$out" == *APROPOS_ENTRY_EXISTED=1* ]] && existed=1
   (( keep )) && [[ -n "$newId" ]] && ei_record "$person" "$start" "$newId"
   # Remember the row just written, so the next turn on this activity amends it. Only
   # entries with a task qualify: the amend path cannot touch a row with no task without
-  # clearing its attribution.
-  if [[ -n "$task" && "$task" != "0" ]]; then
-    [[ -n "$newId" ]] && oe_record "$wt|$task|$proj" "$newId" "$(printf '%s' "$desc" | base64 | tr -d '\n')"
+  # clearing its attribution. A row that already existed is a resend, and never displaces what
+  # the record holds now (oe_record_existing).
+  if [[ -n "$task" && "$task" != "0" && -n "$newId" ]]; then
+    if (( existed )); then
+      oe_record_existing "$wt|$task|$proj" "$newId" "$(printf '%s' "$desc" | base64 | tr -d '\n')"
+    else
+      oe_record "$wt|$task|$proj" "$newId" "$(printf '%s' "$desc" | base64 | tr -d '\n')"
+    fi
+  fi
+  apropos_write_note $(( SECONDS - t0 ))
+  return 0
+}
+
+# HOW LONG A WRITE TAKES ON THIS COMPUTER (0.2.19). A delivery is started only when the run has
+# time left to finish it (the per-turn recorder's flush), and that depends on the computer: about
+# 2 s on a quiet one, 12 to 20 s measured on a busy one. Each real write's seconds are appended here,
+# one per line, and apropos_write_need reads the recent ones. A cut-off write counts as the time it
+# was given, so a computer too busy to finish raises its own estimate.
+APROPOS_WRITE_SECS_FILE="${APROPOS_WRITE_SECS_FILE:-${HOME}/.claude/apropos-time/write-secs.txt}"
+apropos_write_note() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 0
+  printf '%s\n' "$1" >> "$APROPOS_WRITE_SECS_FILE" 2>/dev/null
+  return 0
+}
+# apropos_write_need - sets APROPOS_WRITE_NEED to the seconds a write should be given: the longest
+# of the last 8 recorded, plus 2, between 5 and 25. With none recorded yet, APROPOS_WRITE_SECS
+# (default 20, the busy-computer figure). APROPOS_WRITE_SECS given explicitly always wins. Builtins
+# only, apart from trimming the file once it holds more than 40 lines. Called outside a delivery.
+apropos_write_need() {
+  local l n=0 max=0 i=0 tmp
+  local -a v=()
+  APROPOS_WRITE_NEED="${APROPOS_WRITE_SECS:-20}"
+  [[ "$APROPOS_WRITE_NEED" =~ ^[0-9]{1,4}$ ]] || APROPOS_WRITE_NEED=20
+  [[ -n "${APROPOS_WRITE_SECS:-}" ]] && return 0
+  [[ -s "$APROPOS_WRITE_SECS_FILE" ]] || return 0
+  while IFS= read -r l; do [[ "$l" =~ ^[0-9]{1,5}$ ]] && v[n++]="$l"; done < "$APROPOS_WRITE_SECS_FILE"
+  (( n )) || return 0
+  for (( i = (n > 8 ? n - 8 : 0); i < n; i++ )); do (( 10#${v[i]} > max )) && max=$(( 10#${v[i]} )); done
+  max=$(( max + 2 )); (( max < 5 )) && max=5; (( max > 25 )) && max=25
+  APROPOS_WRITE_NEED="$max"
+  if (( n > 40 )); then
+    tmp="$APROPOS_WRITE_SECS_FILE.tmp.${BASHPID:-$$}"
+    { for (( i = n - 8; i < n; i++ )); do printf '%s\n' "${v[i]}"; done; } > "$tmp" 2>/dev/null \
+      && mv -f "$tmp" "$APROPOS_WRITE_SECS_FILE" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
   fi
   return 0
 }

@@ -154,11 +154,20 @@ si_bounded() {   # si_bounded <seconds> <command...>
   if [[ -n "$SI_TO" ]]; then "$SI_TO" -k "$SI_KILL_GRACE" "$s" "$@"; else "$@"; fi
 }
 left="$(si_left)"
+# How long a write takes on this computer (0.2.19, apropos_write_need in lib/writer.sh) sets the
+# margin, unless APROPOS_SESSION_DELIVERY_SECS is given. And each write is cut off 3 seconds before
+# the hard limit (APROPOS_WRITE_END), so the flush itself ends, releasing its lock, rather than being
+# killed with it held. A write cut off is sent again later; the save-once script returns the row it
+# may already have saved.
+if (( HAVE_LIBS )) && [[ -z "${APROPOS_SESSION_DELIVERY_SECS:-}" ]] && apropos_write_need 2>/dev/null; then
+  [[ "${APROPOS_WRITE_NEED:-}" =~ ^[0-9]+$ ]] && SI_DELIVERY="$APROPOS_WRITE_NEED"
+fi
 if (( HAVE_LIBS )) && (( left > SI_DELIVERY )); then
   export APROPOS_FLUSH_DEADLINE=$(( $(date -u +%s) + left - SI_DELIVERY ))
+  export APROPOS_WRITE_END=$(( $(date -u +%s) + left - 3 )) APROPOS_WRITE_TIMEOUT="$SI_TO"
   si_bounded "$left" bash -c 'source "$1/hooks-handlers/lib/queue.sh"; source "$1/hooks-handlers/lib/writer.sh"; source "$1/hooks-handlers/lib/person.sh"; q_flush "$2" write_entry' _ "$P" "$QUEUE" >/dev/null 2>&1 </dev/null || true
 fi
-unset APROPOS_FLUSH_DEADLINE APROPOS_SWEEP_DEADLINE
+unset APROPOS_FLUSH_DEADLINE APROPOS_SWEEP_DEADLINE APROPOS_WRITE_END APROPOS_WRITE_TIMEOUT
 # This computer's line in the team's machine registry (lib/registry.sh): in the background, under its
 # own hard limit where a coreutils timeout exists, so a slow share never holds this hook. It writes at
 # most once a day, and again only when something it reports has changed. APROPOS_REGISTRY_WAIT=1 (a
